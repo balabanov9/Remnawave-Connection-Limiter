@@ -8,75 +8,91 @@
 
 ## Решение
 
-При обнаружении нарушения центральный сервер отправляет команду на ноды заблокировать IP нарушителя через iptables. Соединение мгновенно рвётся.
+При обнаружении нарушения центральный сервер отправляет команду на **ВСЕ ноды** заблокировать IP нарушителя через iptables. Соединение мгновенно рвётся, и нарушитель не может переключиться на другую ноду.
 
 ```
-┌─────────────────┐                         ┌─────────────────┐
-│  Central Server │                         │    VPN Node     │
-│                 │                         │                 │
-│  checker.py     │── POST /block_ip ──────▶│  node_reporter  │
-│                 │   {"ip": "1.2.3.4",     │        │        │
-│                 │    "duration": 120,     │        ▼        │
-│                 │    "secret": "xxx"}     │   iptables      │
-│                 │                         │   -A INPUT      │
-│                 │                         │   -s 1.2.3.4    │
-│                 │                         │   -j DROP       │
-│                 │                         │                 │
-│                 │                         │  (через 2 мин)  │
-│                 │                         │   iptables      │
-│                 │                         │   -D INPUT ...  │
-└─────────────────┘                         └─────────────────┘
+                                            ┌─────────────────┐
+                                       ┌───▶│  Node Finland   │
+                                       │    │  iptables DROP  │
+┌─────────────────┐                    │    └─────────────────┘
+│  Central Server │                    │
+│                 │── POST /block_ip ──┼───▶┌─────────────────┐
+│  Нарушение!     │   на ВСЕ ноды      │    │  Node Poland    │
+│  IPs: 1.2.3.4   │                    │    │  iptables DROP  │
+│        5.6.7.8  │                    │    └─────────────────┘
+└─────────────────┘                    │
+                                       └───▶┌─────────────────┐
+                                            │  Node Germany   │
+                                            │  iptables DROP  │
+                                            └─────────────────┘
 ```
+
+**Логика:**
+1. Юзер подключен с 2+ IP (нарушение лимита)
+2. Центральный сервер отправляет команду блокировки на ВСЕ ноды
+3. Все ноды добавляют правило iptables для этих IP
+4. Соединения мгновенно рвутся на всех нодах
+5. Через 2 минуты ноды автоматически удаляют правила
 
 ## Настройка
 
 ### 1. На центральном сервере (config.py)
 
 ```python
-# Включить кик
+# Включить кик IP на нодах
 KICK_IPS_ON_VIOLATION = True
 
-# Порт API на нодах
+# Порт API на нодах для приема команд
 NODE_API_PORT = 5001
 
-# Секретный ключ (придумай свой!)
-NODE_API_SECRET = "my_super_secret_key_123"
+# Секретный ключ (придумай сложный!)
+NODE_API_SECRET = "mySuperSecret123!@#"
 
-# Список нод {имя: ip}
-# Имя должно совпадать с NODE_NAME на ноде
+# Список ВСЕХ нод
+# Ключ = имя ноды (NODE_NAME на ноде)
+# Значение = IP адрес ноды
 NODES = {
-    "finland-1": "185.123.45.67",
-    "poland-1": "91.234.56.78",
-    "germany-1": "45.67.89.12",
+    "Finland_XHTTP-yandex-xhttp-ads": "185.100.50.25",
+    "Poland_XHTTP-yandex-xhttp-ads": "91.200.100.75",
+    "Germany_XHTTP-yandex-xhttp-ads": "45.67.89.12",
 }
 ```
 
 ### 2. На каждой ноде (node_reporter.py)
 
 ```python
-# Порт для приема команд (должен совпадать с NODE_API_PORT)
+# URL центрального сервера
+LOG_SERVER_URL = "http://10.0.0.1:5000/log"
+
+# Имя ноды (должно совпадать с ключом в NODES на сервере)
+NODE_NAME = "Finland_XHTTP-yandex-xhttp-ads"
+
+# Путь к логам Xray
+XRAY_LOG_PATH = "/var/log/xray/access.log"
+
+# Порт для приема команд блокировки
 API_PORT = 5001
 
-# Секретный ключ (должен совпадать с NODE_API_SECRET)
-API_SECRET = "my_super_secret_key_123"
-
-# Имя ноды (должно совпадать с ключом в NODES)
-NODE_NAME = "finland-1"
+# Секретный ключ (должен совпадать с NODE_API_SECRET на сервере!)
+API_SECRET = "mySuperSecret123!@#"
 ```
 
 ### 3. Открыть порт на нодах
 
-На каждой ноде открой порт 5001 для центрального сервера:
+На каждой ноде открой порт 5001 **только** для центрального сервера:
 
 ```bash
-# Разрешить только с IP центрального сервера
-iptables -A INPUT -p tcp --dport 5001 -s IP_ЦЕНТРАЛЬНОГО_СЕРВЕРА -j ACCEPT
+# Через iptables (замени IP_СЕРВЕРА на реальный IP)
+iptables -A INPUT -p tcp --dport 5001 -s IP_СЕРВЕРА -j ACCEPT
 iptables -A INPUT -p tcp --dport 5001 -j DROP
+
+# Сохранить правила
+iptables-save > /etc/iptables/rules.v4
 ```
 
 Или через ufw:
 ```bash
-ufw allow from IP_ЦЕНТРАЛЬНОГО_СЕРВЕРА to any port 5001
+ufw allow from IP_СЕРВЕРА to any port 5001
 ```
 
 ### 4. Перезапустить сервисы
@@ -89,54 +105,84 @@ systemctl restart connection-limiter
 systemctl restart node-reporter
 ```
 
-## API ноды
+## Откуда взять имя ноды?
 
-Node reporter теперь слушает на порту 5001:
-
-| Метод | Путь | Описание |
-|-------|------|----------|
-| POST | `/block_ip` | Заблокировать IP |
-| POST | `/unblock_ip` | Разблокировать IP |
-| GET | `/health` | Health check |
-
-**POST /block_ip:**
-```json
-{
-    "ip": "1.2.3.4",
-    "duration": 120,
-    "secret": "my_super_secret_key_123"
-}
+Из логов Xray. Пример лога:
+```
+2025/12/07 15:02:32 from 178.176.86.81:16708 accepted tcp:www.google.com:443 [Poland_XHTTP-yandex-xhttp-ads -> gateway] email: user_848055128
 ```
 
-## Безопасность
-
-- Используй сложный `NODE_API_SECRET`
-- Открой порт 5001 только для IP центрального сервера
-- Не открывай порт 5001 для всего интернета!
+Имя ноды: `Poland_XHTTP-yandex-xhttp-ads` (в квадратных скобках, до `->`)
 
 ## Проверка работы
 
-На ноде посмотри логи:
+### 1. Проверить что API ноды работает
+
+С центрального сервера:
 ```bash
-journalctl -u node-reporter -f
+curl http://IP_НОДЫ:5001/health
+```
+Ответ: `{"status": "ok"}`
+
+### 2. Тестовая блокировка
+
+```bash
+curl -X POST http://IP_НОДЫ:5001/block_ip \
+  -H "Content-Type: application/json" \
+  -d '{"ip": "1.2.3.4", "duration": 60, "secret": "твой_секрет"}'
 ```
 
-При нарушении увидишь:
-```
-[BLOCKED] IP 178.176.86.81 for 120s
-[UNBLOCKED] IP 178.176.86.81
-```
+### 3. Проверить iptables на ноде
 
-Проверить iptables:
 ```bash
 iptables -L INPUT -n | grep DROP
 ```
 
+Увидишь:
+```
+DROP       all  --  1.2.3.4              0.0.0.0/0
+```
+
+### 4. Логи node_reporter
+
+```bash
+journalctl -u node-reporter -f
+```
+
+При блокировке:
+```
+[BLOCKED] IP 1.2.3.4 for 60s
+```
+
+Через 60 сек:
+```
+[UNBLOCKED] IP 1.2.3.4
+```
+
+### 5. Разблокировать вручную
+
+```bash
+# Через API
+curl -X POST http://IP_НОДЫ:5001/unblock_ip \
+  -H "Content-Type: application/json" \
+  -d '{"ip": "1.2.3.4", "secret": "твой_секрет"}'
+
+# Или напрямую на ноде
+iptables -D INPUT -s 1.2.3.4 -j DROP
+```
+
+## Безопасность
+
+⚠️ **Важно:**
+- Используй сложный `NODE_API_SECRET`
+- Открой порт 5001 **только** для IP центрального сервера
+- Никогда не открывай порт 5001 для всего интернета!
+
 ## Отключение
 
-Если не нужен кик — просто оставь в config.py:
+Если не нужен кик — в `config.py`:
 ```python
 KICK_IPS_ON_VIOLATION = False
 ```
 
-Скрипт будет работать как раньше — только блокировка через API Remnawave.
+Скрипт будет работать как раньше — только блокировка через API Remnawave без разрыва соединений.

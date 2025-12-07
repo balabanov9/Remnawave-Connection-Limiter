@@ -4,7 +4,7 @@ import asyncio
 import time
 import aiohttp
 from database import (
-    init_db, get_all_active_users, get_unique_ips, get_user_ips_with_nodes,
+    init_db, get_all_active_users, get_unique_ips,
     add_blocked_user, get_users_to_unblock, remove_blocked_user,
     is_user_blocked, cleanup_old_connections, get_db_stats
 )
@@ -22,18 +22,18 @@ class ConnectionChecker:
         self.running = False
         self.known_nodes = {}  # {node_name: node_ip} - заполняется из логов
 
-    async def kick_ips_from_nodes(self, ips: list, nodes: list):
-        """Send block commands to nodes to kick IPs"""
+    async def kick_ips_from_all_nodes(self, ips: list):
+        """Send block commands to ALL nodes to kick IPs"""
         if not KICK_IPS_ON_VIOLATION:
             return
         
+        if not NODES:
+            print("[WARN] NODES config is empty, cannot kick IPs")
+            return
+        
         async with aiohttp.ClientSession() as session:
-            for node_name in nodes:
-                node_ip = NODES.get(node_name)
-                if not node_ip:
-                    print(f"[WARN] Node {node_name} not in NODES config")
-                    continue
-                
+            # Отправляем на ВСЕ ноды из конфига
+            for node_name, node_ip in NODES.items():
                 for ip in ips:
                     try:
                         url = f"http://{node_ip}:{NODE_API_PORT}/block_ip"
@@ -74,10 +74,8 @@ class ConnectionChecker:
             # Отправляем warning в телеграм
             await notifier.notify_warning(username, ip_count, device_limit, unique_ips)
 
-            # Получаем ноды где юзер подключен и кикаем IP
-            ips_with_nodes = get_user_ips_with_nodes(username)
-            nodes = list(set([n for _, n in ips_with_nodes if n]))
-            await self.kick_ips_from_nodes(unique_ips, nodes)
+            # Кикаем IP на ВСЕХ нодах (чтобы нарушитель не переключился на другую)
+            await self.kick_ips_from_all_nodes(unique_ips)
 
             user_uuid = await self.api.get_user_uuid(username)
             if not user_uuid:
