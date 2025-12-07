@@ -35,13 +35,30 @@ class RemnawaveAPI:
         """Get user's device limit (hwidDeviceLimit)"""
         user = await self.get_user_by_username(username)
         if user:
-            # hwidDeviceLimit - лимит устройств
-            # Если None или 0 - значит без лимита, ставим большое число
-            limit = user.hwidDeviceLimit
-            if limit is None or limit == 0:
-                return 999  # Без лимита
-            return limit
-        return 1  # По умолчанию 1 устройство
+            limit = None
+            
+            try:
+                # Получаем все данные юзера
+                data = user.model_dump()
+                
+                # DEBUG: показать все поля (раскомментируй для отладки)
+                # print(f"[DEBUG] User {username} fields: {list(data.keys())}")
+                
+                # Ищем поле с лимитом устройств
+                for key in ['hwidDeviceLimit', 'hwid_device_limit', 'deviceLimit', 'device_limit']:
+                    if key in data and data[key] is not None:
+                        limit = data[key]
+                        break
+            except Exception as e:
+                print(f"[DEBUG] Error getting user data: {e}")
+            
+            # Если лимит найден и > 0, возвращаем его
+            if limit is not None and limit > 0:
+                return int(limit)
+            
+            # Если None или 0 — без лимита (пропускаем проверку)
+            return 999
+        return 1  # По умолчанию 1 устройство если юзер не найден
 
     async def disable_user(self, uuid: str) -> bool:
         """Disable user subscription"""
