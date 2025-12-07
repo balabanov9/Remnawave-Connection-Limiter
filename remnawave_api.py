@@ -41,8 +41,8 @@ class RemnawaveAPI:
                 # Получаем все данные юзера
                 data = user.model_dump()
                 
-                # DEBUG: показать все поля (раскомментируй для отладки)
-                # print(f"[DEBUG] User {username} fields: {list(data.keys())}")
+                # DEBUG: показать все поля
+                print(f"[DEBUG] User {username} fields: {list(data.keys())}")
                 
                 # Ищем поле с лимитом устройств
                 for key in ['hwidDeviceLimit', 'hwid_device_limit', 'deviceLimit', 'device_limit']:
