@@ -1,0 +1,5 @@
+flask>=2.0.0
+requests>=2.25.0
+remnawave>=2.0.0
+httpx>=0.27.0
+aiohttp>=3.8.0
