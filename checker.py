@@ -2,20 +2,56 @@
 
 import asyncio
 import time
+import aiohttp
 from database import (
-    init_db, get_all_active_users, get_unique_ips,
+    init_db, get_all_active_users, get_unique_ips, get_user_ips_with_nodes,
     add_blocked_user, get_users_to_unblock, remove_blocked_user,
     is_user_blocked, cleanup_old_connections, get_db_stats
 )
 from remnawave_api import RemnawaveAPI
 from telegram_bot import notifier
-from config import CHECK_INTERVAL_SECONDS, BLOCK_DURATION_SECONDS
+from config import (
+    CHECK_INTERVAL_SECONDS, BLOCK_DURATION_SECONDS,
+    NODE_API_SECRET, NODE_API_PORT, KICK_IPS_ON_VIOLATION, NODES
+)
 
 
 class ConnectionChecker:
     def __init__(self):
         self.api = RemnawaveAPI()
         self.running = False
+        self.known_nodes = {}  # {node_name: node_ip} - заполняется из логов
+
+    async def kick_ips_from_nodes(self, ips: list, nodes: list):
+        """Send block commands to nodes to kick IPs"""
+        if not KICK_IPS_ON_VIOLATION:
+            return
+        
+        async with aiohttp.ClientSession() as session:
+            for node_name in nodes:
+                node_ip = NODES.get(node_name)
+                if not node_ip:
+                    print(f"[WARN] Node {node_name} not in NODES config")
+                    continue
+                
+                for ip in ips:
+                    try:
+                        url = f"http://{node_ip}:{NODE_API_PORT}/block_ip"
+                        async with session.post(
+                            url,
+                            json={
+                                "ip": ip,
+                                "duration": BLOCK_DURATION_SECONDS,
+                                "secret": NODE_API_SECRET
+                            },
+                            timeout=aiohttp.ClientTimeout(total=5)
+                        ) as resp:
+                            if resp.status == 200:
+                                print(f"[KICK] Blocked {ip} on {node_name}")
+                            else:
+                                print(f"[WARN] Failed to block {ip} on {node_name}: {resp.status}")
+                    except Exception as e:
+                        print(f"[WARN] Could not reach node {node_name}: {e}")
 
     async def check_user(self, username: str):
         """Check single user for connection limit violation"""
@@ -37,6 +73,11 @@ class ConnectionChecker:
 
             # Отправляем warning в телеграм
             await notifier.notify_warning(username, ip_count, device_limit, unique_ips)
+
+            # Получаем ноды где юзер подключен и кикаем IP
+            ips_with_nodes = get_user_ips_with_nodes(username)
+            nodes = list(set([n for _, n in ips_with_nodes if n]))
+            await self.kick_ips_from_nodes(unique_ips, nodes)
 
             user_uuid = await self.api.get_user_uuid(username)
             if not user_uuid:

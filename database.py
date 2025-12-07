@@ -189,6 +189,24 @@ def cleanup_old_connections(max_age_seconds: int = 120):
     return deleted
 
 
+def get_user_ips_with_nodes(user_email: str) -> list:
+    """Get IPs with their node names for a user"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cutoff_time = int(time.time()) - IP_WINDOW_SECONDS
+    
+    cursor.execute(
+        'SELECT DISTINCT ip_address, node_name FROM connections WHERE user_email = ? AND timestamp > ?',
+        (user_email, cutoff_time)
+    )
+    
+    results = cursor.fetchall()
+    conn.close()
+    
+    return results
+
+
 def get_db_stats() -> dict:
     """Get database statistics"""
     conn = sqlite3.connect(DB_PATH)

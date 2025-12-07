@@ -19,3 +19,15 @@ DB_PATH = "connections.db"  # SQLite база для хранения подкл
 # Telegram notifications (optional)
 TELEGRAM_BOT_TOKEN = ""  # Токен бота от @BotFather (оставь пустым чтобы отключить)
 TELEGRAM_CHAT_ID = ""  # Твой Telegram ID (узнать через @getmyid_bot)
+
+# IP Kick settings (принудительный разрыв соединений через iptables)
+KICK_IPS_ON_VIOLATION = False  # Включить кик IP на нодах (требует настройки нод)
+NODE_API_PORT = 5001  # Порт API на нодах для приема команд блокировки
+NODE_API_SECRET = "change_this_secret"  # Секретный ключ (должен совпадать на нодах)
+
+# Список нод для кика {имя_ноды: ip_адрес}
+# Имя ноды должно совпадать с NODE_NAME в node_reporter.py на ноде
+NODES = {
+    # "finland-1": "1.2.3.4",
+    # "poland-1": "5.6.7.8",
+}
