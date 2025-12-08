@@ -9,9 +9,10 @@ LOG_SERVER_HOST = "0.0.0.0"  # Слушать на всех интерфейса
 LOG_SERVER_PORT = 5000  # Порт для приема логов от нод
 
 # Check settings
-CHECK_INTERVAL_SECONDS = 30  # Как часто проверять подключения
+CHECK_INTERVAL_SECONDS = 15  # Как часто проверять подключения (секунды)
 IP_WINDOW_SECONDS = 60  # Окно времени для подсчета уникальных IP
 BLOCK_DURATION_SECONDS = 120  # На сколько блокировать (2 минуты)
+VIOLATION_CONFIRM_COUNT = 2  # Сколько проверок подряд должно быть нарушение (защита от ложных срабатываний при смене IP)
 
 # Database
 DB_PATH = "connections.db"  # SQLite база для хранения подключений

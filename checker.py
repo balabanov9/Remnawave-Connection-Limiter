@@ -12,7 +12,8 @@ from remnawave_api import RemnawaveAPI
 from telegram_bot import notifier
 from config import (
     CHECK_INTERVAL_SECONDS, BLOCK_DURATION_SECONDS,
-    NODE_API_SECRET, NODE_API_PORT, KICK_IPS_ON_VIOLATION, NODES
+    NODE_API_SECRET, NODE_API_PORT, KICK_IPS_ON_VIOLATION, NODES,
+    VIOLATION_CONFIRM_COUNT
 )
 
 
@@ -20,7 +21,9 @@ class ConnectionChecker:
     def __init__(self):
         self.api = RemnawaveAPI()
         self.running = False
-        self.known_nodes = {}  # {node_name: node_ip} - заполняется из логов
+        # Счётчик нарушений для каждого юзера {username: count}
+        # Нужно несколько подряд нарушений чтобы забанить
+        self.violation_counts = {}
 
     async def kick_ips_from_all_nodes(self, ips: list):
         """Send block commands to ALL nodes to kick IPs"""
@@ -32,7 +35,6 @@ class ConnectionChecker:
             return
         
         async with aiohttp.ClientSession() as session:
-            # Отправляем на ВСЕ ноды из конфига
             for node_name, node_ip in NODES.items():
                 for ip in ips:
                     try:
@@ -56,25 +58,43 @@ class ConnectionChecker:
     async def check_user(self, username: str):
         """Check single user for connection limit violation"""
         if is_user_blocked(username):
+            # Сбрасываем счётчик для заблокированных
+            self.violation_counts.pop(username, None)
             return
 
         unique_ips = get_unique_ips(username)
         ip_count = len(unique_ips)
 
         if ip_count == 0:
+            # Нет активности — сбрасываем счётчик
+            self.violation_counts.pop(username, None)
             return
 
         device_limit = await self.api.get_user_device_limit(username)
-        print(f"[CHECK] User {username}: {ip_count} IPs, limit: {device_limit}")
 
         if ip_count > device_limit:
-            print(f"[VIOLATION] User {username} has {ip_count} IPs, limit: {device_limit}")
+            # Увеличиваем счётчик нарушений
+            self.violation_counts[username] = self.violation_counts.get(username, 0) + 1
+            current_count = self.violation_counts[username]
+            
+            print(f"[CHECK] User {username}: {ip_count} IPs, limit: {device_limit}, violations: {current_count}/{VIOLATION_CONFIRM_COUNT}")
+            
+            # Проверяем достаточно ли нарушений подряд
+            if current_count < VIOLATION_CONFIRM_COUNT:
+                print(f"[WARN] User {username} exceeds limit, waiting for confirmation ({current_count}/{VIOLATION_CONFIRM_COUNT})")
+                return
+            
+            # Подтверждённое нарушение!
+            print(f"[VIOLATION] User {username} confirmed: {ip_count} IPs, limit: {device_limit}")
             print(f"[VIOLATION] IPs: {unique_ips}")
+
+            # Сбрасываем счётчик
+            self.violation_counts.pop(username, None)
 
             # Отправляем warning в телеграм
             await notifier.notify_warning(username, ip_count, device_limit, unique_ips)
 
-            # Кикаем IP на ВСЕХ нодах (чтобы нарушитель не переключился на другую)
+            # Кикаем IP на ВСЕХ нодах
             await self.kick_ips_from_all_nodes(unique_ips)
 
             user_uuid = await self.api.get_user_uuid(username)
@@ -89,8 +109,10 @@ class ConnectionChecker:
                 add_blocked_user(username, blocked_until, current_status)
                 print(f"[BLOCKED] User {username} for {BLOCK_DURATION_SECONDS}s")
                 
-                # Отправляем уведомление о блокировке
                 await notifier.notify_disabled(username)
+        else:
+            # Нет нарушения — сбрасываем счётчик
+            self.violation_counts.pop(username, None)
 
     async def unblock_expired(self):
         """Unblock users whose block time has expired"""
@@ -108,8 +130,6 @@ class ConnectionChecker:
             if await self.api.enable_user(user_uuid):
                 remove_blocked_user(username)
                 print(f"[UNBLOCKED] User {username} is now active")
-                
-                # Отправляем уведомление о разблокировке
                 await notifier.notify_enabled(username)
 
     async def run_check_cycle(self):
@@ -127,18 +147,18 @@ class ConnectionChecker:
             except Exception as e:
                 print(f"[ERROR] Error checking {username}: {e}")
 
-        # Агрессивная очистка — удаляем записи старше 2 минут
+        # Очистка старых записей
         cleanup_old_connections(max_age_seconds=120)
         
-        # Показываем статистику базы
         stats = get_db_stats()
-        print(f"[STATS] DB: {stats['total_connections']} connections, {stats['blocked_users']} blocked")
+        print(f"[STATS] DB: {stats['total_connections']} connections, {stats['blocked_users']} blocked, pending violations: {len(self.violation_counts)}")
 
     async def start(self):
         """Start the checker loop"""
         self.running = True
         init_db()
         print("[START] Connection checker started")
+        print(f"[CONFIG] Check interval: {CHECK_INTERVAL_SECONDS}s, Confirm count: {VIOLATION_CONFIRM_COUNT}")
 
         while self.running:
             try:
