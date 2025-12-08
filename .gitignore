@@ -1,6 +1,3 @@
-# Config with secrets
-config.py
-
 # Database
 *.db
 
