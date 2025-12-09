@@ -9,6 +9,7 @@ from database import (
 )
 from remnawave_api import RemnawaveAPI
 from telegram_bot import notifier
+from events_log import log_drop, log_error, log_info
 from config import (
     CHECK_INTERVAL_SECONDS, DROP_DURATION_SECONDS,
     NODE_API_SECRET, NODE_API_PORT, NODES
@@ -99,6 +100,9 @@ class ConnectionChecker:
             connections_to_drop.extend(ip_connections[ip])
         
         print(f"[DROP] User {username}: dropping IPs {ips_to_drop}")
+        
+        # Логируем событие для админки
+        log_drop(username, ip_count, device_limit, ips_to_drop)
         
         # Отправляем в телеграм
         await notifier.notify_drop(username, ip_count, device_limit, ips_to_drop)

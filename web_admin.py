@@ -166,6 +166,7 @@ ADMIN_HTML = """
             <a href="/" class="tab {{ 'active' if tab == 'dashboard' }}">📊 Dashboard</a>
             <a href="/nodes" class="tab {{ 'active' if tab == 'nodes' }}">🖥️ Ноды</a>
             <a href="/settings" class="tab {{ 'active' if tab == 'settings' }}">⚙️ Настройки</a>
+            <a href="/debug" class="tab {{ 'active' if tab == 'debug' }}">🔧 Debug</a>
         </div>
         
         {{ content | safe }}
@@ -261,6 +262,37 @@ DASHBOARD_CONTENT = """
     <form method="POST" action="/clear_db" style="display: inline; margin-left: 10px;">
         <button type="submit" class="btn btn-sm btn-danger">🗑️ Очистить БД</button>
     </form>
+</div>
+
+<div class="card">
+    <h2>📋 Последние события</h2>
+    {% if events %}
+    <div style="max-height: 400px; overflow-y: auto;">
+        {% for event in events %}
+        <div style="padding: 10px; border-bottom: 1px solid #333; font-size: 13px;">
+            <span style="color: #666;">{{ event.time }}</span>
+            {% if event.type == 'drop' %}
+                <span class="status status-warn" style="margin-left: 10px;">DROP</span>
+            {% elif event.type == 'error' %}
+                <span class="status status-error" style="margin-left: 10px;">ERROR</span>
+            {% else %}
+                <span class="status status-ok" style="margin-left: 10px;">INFO</span>
+            {% endif %}
+            <span style="margin-left: 10px;">{{ event.message }}</span>
+            {% if event.details.dropped %}
+                <div style="color: #aaa; margin-top: 5px; font-size: 12px;">
+                    Dropped: {{ event.details.dropped | join(', ') }}
+                </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+    <form method="POST" action="/clear_events" style="margin-top: 10px;">
+        <button type="submit" class="btn btn-sm btn-danger">🗑️ Очистить лог</button>
+    </form>
+    {% else %}
+    <p style="color: #666;">Нет событий</p>
+    {% endif %}
 </div>
 """
 
@@ -612,10 +644,18 @@ def dashboard():
     telegram_status = check_telegram_status()
     api_status = check_api_status()
     
+    # Get events
+    try:
+        from events_log import get_events
+        events = get_events(30)
+    except:
+        events = []
+    
     from flask import render_template_string as rts
     content = rts(DASHBOARD_CONTENT, 
                   config=config, stats=stats, nodes=nodes,
-                  telegram_status=telegram_status, api_status=api_status)
+                  telegram_status=telegram_status, api_status=api_status,
+                  events=events)
     
     return render_template_string(ADMIN_HTML, content=content, tab='dashboard',
                                   message=request.args.get('message'),
@@ -801,6 +841,86 @@ def clear_db():
         return redirect('/?message=База данных очищена&success=true')
     except Exception as e:
         return redirect(f'/?message=Ошибка: {e}&success=false')
+
+
+@app.route('/clear_events', methods=['POST'])
+@login_required
+def clear_events_route():
+    try:
+        from events_log import clear_events
+        clear_events()
+        return redirect('/?message=Лог очищен&success=true')
+    except Exception as e:
+        return redirect(f'/?message=Ошибка: {e}&success=false')
+
+
+@app.route('/debug')
+@login_required
+def debug_page():
+    """Debug page to test API"""
+    config = read_config()
+    debug_info = {
+        "api_url": config.get('REMNAWAVE_API_URL', ''),
+        "token_set": bool(config.get('REMNAWAVE_API_TOKEN', '')),
+    }
+    
+    # Test API call
+    test_result = None
+    test_user_id = request.args.get('user_id', '')
+    if test_user_id:
+        import requests
+        try:
+            url = f"{config['REMNAWAVE_API_URL']}/api/users/by-id/{test_user_id}"
+            headers = {"Authorization": f"Bearer {config['REMNAWAVE_API_TOKEN']}"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            test_result = {
+                "status": resp.status_code,
+                "response": resp.text[:2000] if resp.text else "Empty"
+            }
+        except Exception as e:
+            test_result = {"error": str(e)}
+    
+    content = f"""
+    <div class="card">
+        <h2>🔧 Debug Info</h2>
+        <p>API URL: <code>{debug_info['api_url']}</code></p>
+        <p>Token set: <code>{debug_info['token_set']}</code></p>
+    </div>
+    
+    <div class="card">
+        <h2>🧪 Test API Call</h2>
+        <form method="GET">
+            <div class="form-group">
+                <label>User ID (number from logs)</label>
+                <input type="text" name="user_id" value="{test_user_id}" placeholder="1234">
+            </div>
+            <button type="submit" class="btn">Test /api/users/by-id/</button>
+        </form>
+        
+        {f'''
+        <div style="margin-top: 20px;">
+            <h3>Result:</h3>
+            <p>Status: <code>{test_result.get('status', test_result.get('error', ''))}</code></p>
+            <pre style="background: #0f0f23; padding: 15px; border-radius: 8px; overflow-x: auto; font-size: 12px; max-height: 400px;">{test_result.get('response', test_result.get('error', ''))}</pre>
+        </div>
+        ''' if test_result else ''}
+    </div>
+    
+    <div class="card">
+        <h2>📡 Available API Endpoints</h2>
+        <ul style="color: #aaa; line-height: 2;">
+            <li><code>GET /api/users/by-id/{{id}}</code> - Get user by ID</li>
+            <li><code>GET /api/users/by-username/{{username}}</code> - Get user by username</li>
+            <li><code>GET /api/users/{{uuid}}</code> - Get user by UUID</li>
+            <li><code>POST /api/users/{{uuid}}/actions/disable</code> - Disable user</li>
+            <li><code>POST /api/users/{{uuid}}/actions/enable</code> - Enable user</li>
+        </ul>
+    </div>
+    """
+    
+    return render_template_string(ADMIN_HTML, content=content, tab='debug',
+                                  message=request.args.get('message'),
+                                  success=request.args.get('success', 'true') == 'true')
 
 
 def run_admin(host='0.0.0.0', port=8080):
