@@ -1,19 +1,55 @@
-"""Events log for admin panel"""
+"""Events log for admin panel with console capture"""
 
+import sys
 import time
 from collections import deque
 from threading import Lock
 
-# Хранилище последних событий (максимум 100)
-MAX_EVENTS = 100
+# Хранилище последних событий (максимум 200)
+MAX_EVENTS = 200
 events = deque(maxlen=MAX_EVENTS)
 events_lock = Lock()
+
+# Оригинальный stdout
+_original_stdout = sys.stdout
+
+
+class LogCapture:
+    """Capture print() output and send to events log"""
+    
+    def __init__(self, original):
+        self.original = original
+    
+    def write(self, text):
+        # Пишем в оригинальный stdout
+        self.original.write(text)
+        
+        # Добавляем в events если не пустая строка
+        text = text.strip()
+        if text:
+            event_type = "info"
+            if "[ERROR]" in text:
+                event_type = "error"
+            elif "[DROP]" in text or "[EXCESS]" in text:
+                event_type = "drop"
+            elif "[WARN]" in text:
+                event_type = "warn"
+            
+            add_event(event_type, text)
+    
+    def flush(self):
+        self.original.flush()
+
+
+def start_capture():
+    """Start capturing print output"""
+    sys.stdout = LogCapture(_original_stdout)
 
 
 def add_event(event_type: str, message: str, details: dict = None):
     """Add event to log"""
     event = {
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "time": time.strftime("%H:%M:%S"),
         "timestamp": int(time.time()),
         "type": event_type,
         "message": message,

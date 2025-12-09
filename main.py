@@ -4,6 +4,11 @@ import asyncio
 import signal
 import sys
 import threading
+
+# Start log capture FIRST before any imports that might print
+from events_log import start_capture
+start_capture()
+
 from log_server import app as log_app
 from web_admin import app as admin_app
 from checker import ConnectionChecker
