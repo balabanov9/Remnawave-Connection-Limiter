@@ -1,4 +1,4 @@
-"""Node reporter - real-time log monitoring and reporting"""
+"""Node reporter - real-time log monitoring with .env config"""
 
 import requests
 import re
@@ -7,35 +7,43 @@ import os
 import json
 import subprocess
 import threading
-import select
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Configuration
-LOG_SERVER_URL = "http://YOUR_SERVER:5000/log"
-NODE_NAME = "node-1"
-XRAY_LOG_PATH = "/var/log/xray/access.log"
-API_PORT = 5001
-API_SECRET = "change_this_secret"
+# Load .env file
+def load_env():
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ.setdefault(key.strip(), value.strip())
 
-# Blocked IPs
+load_env()
+
+# Configuration from .env
+LOG_SERVER_URL = os.environ.get('LOG_SERVER_URL', 'http://localhost:5000/log')
+NODE_NAME = os.environ.get('NODE_NAME', 'node-1')
+XRAY_LOG_PATH = os.environ.get('XRAY_LOG_PATH', '/var/log/xray/access.log')
+API_PORT = int(os.environ.get('API_PORT', '5001'))
+API_SECRET = os.environ.get('API_SECRET', 'change_this_secret')
+
 blocked_ips = {}
 blocked_ips_lock = threading.Lock()
-
-# Session for connection reuse
 session = requests.Session()
 
 
-def parse_log_line(line: str) -> tuple:
+def parse_log_line(line):
     """Parse Xray log line, returns (username, ip)"""
     ip_match = re.search(r'from (?:tcp:)?(\d+\.\d+\.\d+\.\d+):\d+', line)
     email_match = re.search(r'email:\s*(\S+)', line)
-    
     if ip_match and email_match:
         return email_match.group(1), ip_match.group(1)
     return None, None
 
 
-def report_connection(username: str, ip: str):
+def report_connection(username, ip):
     """Send connection to central server immediately"""
     try:
         session.post(
@@ -51,20 +59,16 @@ def tail_log_file():
     """Tail log file and report connections in real-time"""
     print(f"[START] Watching {XRAY_LOG_PATH}")
     
-    # Wait for file to exist
     while not os.path.exists(XRAY_LOG_PATH):
         print(f"[WAIT] Log file not found, waiting...")
         time.sleep(5)
     
-    # Open file and seek to end
     f = open(XRAY_LOG_PATH, 'r')
     f.seek(0, 2)  # Go to end
-    
     current_inode = os.stat(XRAY_LOG_PATH).st_ino
     
     while True:
         line = f.readline()
-        
         if line:
             username, ip = parse_log_line(line.strip())
             if username and ip:
@@ -79,21 +83,16 @@ def tail_log_file():
                     current_inode = os.stat(XRAY_LOG_PATH).st_ino
             except:
                 pass
-            
-            time.sleep(0.1)  # Small delay when no new lines
+            time.sleep(0.1)
 
 
-# ============ IP BLOCKING ============
-
-def block_ip(ip: str, duration: int = 60):
+def block_ip(ip, duration=60):
     """Block IP using iptables"""
     try:
-        # Check if already blocked
         check = subprocess.run(
             ['iptables', '-C', 'INPUT', '-s', ip, '-j', 'DROP'],
             capture_output=True
         )
-        
         if check.returncode != 0:
             subprocess.run(
                 ['iptables', '-I', 'INPUT', '-s', ip, '-j', 'DROP'],
@@ -103,14 +102,13 @@ def block_ip(ip: str, duration: int = 60):
         
         with blocked_ips_lock:
             blocked_ips[ip] = time.time() + duration
-        
         return True
     except Exception as e:
         print(f"[ERROR] Block {ip}: {e}")
         return False
 
 
-def unblock_ip(ip: str):
+def unblock_ip(ip):
     """Unblock IP"""
     try:
         subprocess.run(
@@ -118,34 +116,27 @@ def unblock_ip(ip: str):
             capture_output=True
         )
         print(f"[UNBLOCKED] {ip}")
-        return True
     except:
-        return False
-
-
-def cleanup_expired():
-    """Remove expired blocks"""
-    now = time.time()
-    to_unblock = []
-    
-    with blocked_ips_lock:
-        for ip, expire_time in list(blocked_ips.items()):
-            if now >= expire_time:
-                to_unblock.append(ip)
-                del blocked_ips[ip]
-    
-    for ip in to_unblock:
-        unblock_ip(ip)
+        pass
 
 
 def cleanup_loop():
-    """Periodic cleanup"""
+    """Periodic cleanup of expired blocks"""
     while True:
-        cleanup_expired()
+        now = time.time()
+        to_unblock = []
+        
+        with blocked_ips_lock:
+            for ip, expire_time in list(blocked_ips.items()):
+                if now >= expire_time:
+                    to_unblock.append(ip)
+                    del blocked_ips[ip]
+        
+        for ip in to_unblock:
+            unblock_ip(ip)
+        
         time.sleep(10)
 
-
-# ============ HTTP API ============
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -201,6 +192,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({
                 "status": "ok",
+                "node": NODE_NAME,
                 "blocked_count": len(blocked_ips)
             }).encode())
         elif self.path == '/blocked':
@@ -220,8 +212,6 @@ def run_api():
     print(f"[API] Listening on port {API_PORT}")
     server.serve_forever()
 
-
-# ============ MAIN ============
 
 def main():
     print(f"[START] Node Reporter - {NODE_NAME}")
