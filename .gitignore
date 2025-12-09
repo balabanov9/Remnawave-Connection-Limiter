@@ -1,3 +1,7 @@
+# Config (user settings)
+.env
+.admin_password
+
 # Database
 *.db
 
