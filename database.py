@@ -242,6 +242,24 @@ def get_db_stats() -> dict:
     }
 
 
+def get_unique_ips_for_user(user_email: str) -> list:
+    """Get unique IPs for user within time window - fast version"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cutoff_time = int(time.time()) - IP_WINDOW_SECONDS
+    
+    cursor.execute(
+        'SELECT DISTINCT ip_address FROM connections WHERE user_email = ? AND timestamp > ?',
+        (user_email, cutoff_time)
+    )
+    
+    ips = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    
+    return ips
+
+
 def get_users_with_multiple_ips() -> list:
     """Get users who have more than 1 unique IP - returns [(username, [(ip, port), ...]), ...]"""
     conn = sqlite3.connect(DB_PATH)

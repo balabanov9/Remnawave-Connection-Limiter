@@ -1,7 +1,4 @@
-"""
-Script to run on VPN nodes to report connections and handle IP blocking
-Deploy this on each VPN node
-"""
+"""Node reporter - real-time log monitoring and reporting"""
 
 import requests
 import re
@@ -10,317 +7,191 @@ import os
 import json
 import subprocess
 import threading
+import select
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Configuration - adjust for your setup
-LOG_SERVER_URL = "http://your-server:5000/log"  # URL центрального сервера
-NODE_NAME = "node-1"  # Имя этой ноды
-XRAY_LOG_PATH = "/var/log/xray/access.log"  # Путь к логам Xray
-STATE_FILE = "/tmp/node_reporter_state.json"  # Файл для сохранения позиции
-READ_INTERVAL = 10  # Читать лог каждые 10 секунд
+# Configuration
+LOG_SERVER_URL = "http://YOUR_SERVER:5000/log"
+NODE_NAME = "node-1"
+XRAY_LOG_PATH = "/var/log/xray/access.log"
+API_PORT = 5001
+API_SECRET = "change_this_secret"
 
-# API server for receiving block commands
-API_PORT = 5001  # Порт для приема команд блокировки
-API_SECRET = "change_this_secret"  # Секретный ключ для авторизации
-
-# Blocked IPs storage
-blocked_ips = {}  # {ip: unblock_time}
+# Blocked IPs
+blocked_ips = {}
 blocked_ips_lock = threading.Lock()
 
-
-def load_state() -> dict:
-    """Load last read position from state file"""
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        print(f"[WARN] Could not load state: {e}")
-    return {"position": 0, "inode": 0}
+# Session for connection reuse
+session = requests.Session()
 
 
-def save_state(position: int, inode: int):
-    """Save current position to state file"""
-    try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump({"position": position, "inode": inode}, f)
-    except Exception as e:
-        print(f"[WARN] Could not save state: {e}")
-
-
-def get_file_inode(filepath: str) -> int:
-    """Get file inode to detect log rotation"""
-    try:
-        return os.stat(filepath).st_ino
-    except:
-        return 0
-
-
-def parse_xray_log_line(line: str) -> tuple:
-    """Parse Xray access log line, returns (username, ip, port)"""
-    ip_port_pattern = r'from (?:tcp:)?(\d+\.\d+\.\d+\.\d+):(\d+)'
-    email_pattern = r'email:\s*(\S+)'
-    
-    ip_match = re.search(ip_port_pattern, line)
-    email_match = re.search(email_pattern, line)
+def parse_log_line(line: str) -> tuple:
+    """Parse Xray log line, returns (username, ip)"""
+    ip_match = re.search(r'from (?:tcp:)?(\d+\.\d+\.\d+\.\d+):\d+', line)
+    email_match = re.search(r'email:\s*(\S+)', line)
     
     if ip_match and email_match:
-        ip = ip_match.group(1)
-        port = ip_match.group(2)
-        username = email_match.group(1)
-        return username, ip, port
-    
-    return None, None, None
+        return email_match.group(1), ip_match.group(1)
+    return None, None
 
 
-def report_connections(connections: list):
-    """Send batch of connections to central server"""
-    if not connections:
-        return
-    
+def report_connection(username: str, ip: str):
+    """Send connection to central server immediately"""
     try:
-        response = requests.post(
-            LOG_SERVER_URL.replace('/log', '/log_batch'),
-            json={"connections": connections},
-            timeout=30
+        session.post(
+            LOG_SERVER_URL,
+            json={"user_email": username, "ip_address": ip, "node_name": NODE_NAME},
+            timeout=2
         )
-        if response.status_code == 200:
-            print(f"[OK] Reported {len(connections)} connections")
+    except:
+        pass
+
+
+def tail_log_file():
+    """Tail log file and report connections in real-time"""
+    print(f"[START] Watching {XRAY_LOG_PATH}")
+    
+    # Wait for file to exist
+    while not os.path.exists(XRAY_LOG_PATH):
+        print(f"[WAIT] Log file not found, waiting...")
+        time.sleep(5)
+    
+    # Open file and seek to end
+    f = open(XRAY_LOG_PATH, 'r')
+    f.seek(0, 2)  # Go to end
+    
+    current_inode = os.stat(XRAY_LOG_PATH).st_ino
+    
+    while True:
+        line = f.readline()
+        
+        if line:
+            username, ip = parse_log_line(line.strip())
+            if username and ip:
+                report_connection(username, ip)
         else:
-            print(f"[ERROR] Server returned {response.status_code}")
-    except requests.RequestException as e:
-        print(f"[ERROR] Failed to report: {e}")
-
-
-def read_new_lines():
-    """Read new lines from log file since last position"""
-    if not os.path.exists(XRAY_LOG_PATH):
-        print(f"[WARN] Log file not found: {XRAY_LOG_PATH}")
-        return []
-    
-    state = load_state()
-    current_inode = get_file_inode(XRAY_LOG_PATH)
-    
-    if state["inode"] != current_inode:
-        print("[INFO] Log file rotated, starting from beginning")
-        state["position"] = 0
-        state["inode"] = current_inode
-    
-    file_size = os.path.getsize(XRAY_LOG_PATH)
-    
-    if file_size < state["position"]:
-        print("[INFO] Log file truncated, starting from beginning")
-        state["position"] = 0
-    
-    connections = []
-    new_position = state["position"]
-    
-    try:
-        with open(XRAY_LOG_PATH, 'r', encoding='utf-8', errors='ignore') as f:
-            f.seek(state["position"])
+            # Check for log rotation
+            try:
+                if os.stat(XRAY_LOG_PATH).st_ino != current_inode:
+                    print("[INFO] Log rotated, reopening")
+                    f.close()
+                    f = open(XRAY_LOG_PATH, 'r')
+                    current_inode = os.stat(XRAY_LOG_PATH).st_ino
+            except:
+                pass
             
-            for line in f:
-                username, ip, port = parse_xray_log_line(line.strip())
-                if username and ip:
-                    connections.append({
-                        "user_email": username,
-                        "ip_address": ip,
-                        "port": port,
-                        "node_name": NODE_NAME
-                    })
-            
-            new_position = f.tell()
-    
-    except Exception as e:
-        print(f"[ERROR] Failed to read log: {e}")
-        return []
-    
-    save_state(new_position, current_inode)
-    
-    # Deduplicate by user:ip:port
-    seen = set()
-    unique_connections = []
-    for conn in connections:
-        key = f"{conn['user_email']}:{conn['ip_address']}:{conn['port']}"
-        if key not in seen:
-            seen.add(key)
-            unique_connections.append(conn)
-    
-    return unique_connections
+            time.sleep(0.1)  # Small delay when no new lines
 
 
 # ============ IP BLOCKING ============
 
-def block_ip(ip: str, port: str = None, duration: int = 120):
-    """Block IP or IP:port using iptables"""
+def block_ip(ip: str, duration: int = 60):
+    """Block IP using iptables"""
     try:
-        if port:
-            # Block specific IP:port (source port)
-            check_cmd = ['iptables', '-C', 'INPUT', '-s', ip, '--sport', port, '-j', 'DROP']
-            add_cmd = ['iptables', '-A', 'INPUT', '-s', ip, '-p', 'tcp', '--sport', port, '-j', 'DROP']
-            block_key = f"{ip}:{port}"
-        else:
-            # Block entire IP
-            check_cmd = ['iptables', '-C', 'INPUT', '-s', ip, '-j', 'DROP']
-            add_cmd = ['iptables', '-A', 'INPUT', '-s', ip, '-j', 'DROP']
-            block_key = ip
+        # Check if already blocked
+        check = subprocess.run(
+            ['iptables', '-C', 'INPUT', '-s', ip, '-j', 'DROP'],
+            capture_output=True
+        )
         
-        result = subprocess.run(check_cmd, capture_output=True)
-        
-        if result.returncode != 0:
-            subprocess.run(add_cmd, check=True)
-            print(f"[BLOCKED] {block_key} for {duration}s")
-        else:
-            print(f"[INFO] {block_key} already blocked")
+        if check.returncode != 0:
+            subprocess.run(
+                ['iptables', '-I', 'INPUT', '-s', ip, '-j', 'DROP'],
+                check=True
+            )
+            print(f"[BLOCKED] {ip} for {duration}s")
         
         with blocked_ips_lock:
-            blocked_ips[block_key] = time.time() + duration
+            blocked_ips[ip] = time.time() + duration
         
         return True
     except Exception as e:
-        print(f"[ERROR] Failed to block {ip}:{port}: {e}")
+        print(f"[ERROR] Block {ip}: {e}")
         return False
 
 
-def unblock_ip(ip: str, port: str = None):
-    """Unblock IP or IP:port"""
+def unblock_ip(ip: str):
+    """Unblock IP"""
     try:
-        if port:
-            cmd = ['iptables', '-D', 'INPUT', '-s', ip, '-p', 'tcp', '--sport', port, '-j', 'DROP']
-            block_key = f"{ip}:{port}"
-        else:
-            cmd = ['iptables', '-D', 'INPUT', '-s', ip, '-j', 'DROP']
-            block_key = ip
-        
-        subprocess.run(cmd, check=True, capture_output=True)
-        print(f"[UNBLOCKED] {block_key}")
+        subprocess.run(
+            ['iptables', '-D', 'INPUT', '-s', ip, '-j', 'DROP'],
+            capture_output=True
+        )
+        print(f"[UNBLOCKED] {ip}")
         return True
-    except Exception as e:
+    except:
         return False
 
 
-def cleanup_expired_blocks():
-    """Remove expired IP blocks"""
-    current_time = time.time()
+def cleanup_expired():
+    """Remove expired blocks"""
+    now = time.time()
     to_unblock = []
     
     with blocked_ips_lock:
-        for block_key, unblock_time in list(blocked_ips.items()):
-            if current_time >= unblock_time:
-                to_unblock.append(block_key)
-                del blocked_ips[block_key]
+        for ip, expire_time in list(blocked_ips.items()):
+            if now >= expire_time:
+                to_unblock.append(ip)
+                del blocked_ips[ip]
     
-    for block_key in to_unblock:
-        if ':' in block_key:
-            ip, port = block_key.split(':', 1)
-            unblock_ip(ip, port)
-        else:
-            unblock_ip(block_key)
+    for ip in to_unblock:
+        unblock_ip(ip)
 
 
-# ============ HTTP API SERVER ============
+def cleanup_loop():
+    """Periodic cleanup"""
+    while True:
+        cleanup_expired()
+        time.sleep(10)
 
-class BlockAPIHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # Suppress default logging
+
+# ============ HTTP API ============
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
     
     def do_POST(self):
-        if self.path == '/block_ip':
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode('utf-8')
+        try:
+            data = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
             
-            try:
-                data = json.loads(body)
-                
-                # Check secret
-                if data.get('secret') != API_SECRET:
-                    self.send_response(403)
-                    self.end_headers()
-                    self.wfile.write(b'{"error": "Invalid secret"}')
-                    return
-                
+            if data.get('secret') != API_SECRET:
+                self.send_response(403)
+                self.end_headers()
+                return
+            
+            if self.path == '/block_ip':
                 ip = data.get('ip')
-                port = data.get('port')  # Optional - if provided, block IP:port
-                duration = data.get('duration', 120)
-                
-                if not ip:
+                duration = data.get('duration', 60)
+                if ip:
+                    ok = block_ip(ip, duration)
+                    self.send_response(200 if ok else 500)
+                else:
                     self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b'{"error": "Missing ip"}')
-                    return
-                
-                success = block_ip(ip, port, duration)
-                
-                self.send_response(200 if success else 500)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"success": success, "ip": ip}).encode())
-                
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
-        
-        elif self.path == '/clear_iptables':
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode('utf-8')
             
-            try:
-                data = json.loads(body)
-                
-                if data.get('secret') != API_SECRET:
-                    self.send_response(403)
-                    self.end_headers()
-                    return
-                
-                # Clear all DROP rules in INPUT chain
+            elif self.path == '/unblock_ip':
+                ip = data.get('ip')
+                if ip:
+                    unblock_ip(ip)
+                    with blocked_ips_lock:
+                        blocked_ips.pop(ip, None)
+                self.send_response(200)
+            
+            elif self.path == '/clear_iptables':
                 subprocess.run(['iptables', '-F', 'INPUT'], capture_output=True)
                 with blocked_ips_lock:
                     blocked_ips.clear()
-                
-                print("[CLEARED] All iptables INPUT rules")
-                
+                print("[CLEARED] All iptables rules")
                 self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"success": true}')
-                
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
-        
-        elif self.path == '/unblock_ip':
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode('utf-8')
             
-            try:
-                data = json.loads(body)
-                
-                if data.get('secret') != API_SECRET:
-                    self.send_response(403)
-                    self.end_headers()
-                    return
-                
-                ip = data.get('ip')
-                port = data.get('port')
-                if ip:
-                    unblock_ip(ip, port)
-                    block_key = f"{ip}:{port}" if port else ip
-                    with blocked_ips_lock:
-                        blocked_ips.pop(block_key, None)
-                
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"success": true}')
-                
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
+            else:
+                self.send_response(404)
+            
+            self.end_headers()
         
-        else:
-            self.send_response(404)
+        except Exception as e:
+            print(f"[ERROR] API: {e}")
+            self.send_response(500)
             self.end_headers()
     
     def do_GET(self):
@@ -328,49 +199,47 @@ class BlockAPIHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(b'{"status": "ok"}')
+            self.wfile.write(json.dumps({
+                "status": "ok",
+                "blocked_count": len(blocked_ips)
+            }).encode())
+        elif self.path == '/blocked':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            with blocked_ips_lock:
+                self.wfile.write(json.dumps(list(blocked_ips.keys())).encode())
         else:
             self.send_response(404)
             self.end_headers()
 
 
-def run_api_server():
-    """Run HTTP API server for block commands"""
-    server = HTTPServer(('0.0.0.0', API_PORT), BlockAPIHandler)
+def run_api():
+    """Run HTTP API server"""
+    server = HTTPServer(('0.0.0.0', API_PORT), Handler)
     print(f"[API] Listening on port {API_PORT}")
     server.serve_forever()
 
 
 # ============ MAIN ============
 
-def run_reporter():
-    """Main reporter loop"""
-    print(f"[START] Node reporter started for {NODE_NAME}")
-    print(f"[INFO] Log file: {XRAY_LOG_PATH}")
-    print(f"[INFO] Server: {LOG_SERVER_URL}")
-    print(f"[INFO] API port: {API_PORT}")
+def main():
+    print(f"[START] Node Reporter - {NODE_NAME}")
+    print(f"[CONFIG] Server: {LOG_SERVER_URL}")
+    print(f"[CONFIG] Log: {XRAY_LOG_PATH}")
+    print(f"[CONFIG] API port: {API_PORT}")
     
-    # Start API server in background
-    api_thread = threading.Thread(target=run_api_server, daemon=True)
+    # Start API server
+    api_thread = threading.Thread(target=run_api, daemon=True)
     api_thread.start()
     
-    while True:
-        try:
-            # Read and report connections
-            connections = read_new_lines()
-            
-            if connections:
-                print(f"[INFO] Found {len(connections)} unique connections")
-                report_connections(connections)
-            
-            # Cleanup expired blocks
-            cleanup_expired_blocks()
-        
-        except Exception as e:
-            print(f"[ERROR] {e}")
-        
-        time.sleep(READ_INTERVAL)
+    # Start cleanup loop
+    cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
+    cleanup_thread.start()
+    
+    # Start tailing log (main thread)
+    tail_log_file()
 
 
 if __name__ == '__main__':
-    run_reporter()
+    main()

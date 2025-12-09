@@ -1,12 +1,11 @@
-"""Main entry point - runs log server, checker and admin panel together"""
+"""Main entry point - runs async log server and admin panel"""
 
 import asyncio
 import signal
 import sys
-import threading
 import logging
+import threading
 
-# Настраиваем логирование в stderr чтобы видеть в journalctl
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -14,24 +13,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Start log capture FIRST before any imports that might print
 from events_log import start_capture
 start_capture()
 
-from log_server import app as log_app
+from log_server import LogServer
 from web_admin import app as admin_app
-from checker import ConnectionChecker
 from database import init_db
-from config import LOG_SERVER_HOST, LOG_SERVER_PORT
+from config import LOG_SERVER_PORT
 
 ADMIN_PORT = 8080
-
-
-def run_log_server():
-    """Run log server Flask in a separate thread"""
-    import logging as flask_log
-    flask_log.getLogger('werkzeug').setLevel(flask_log.WARNING)
-    log_app.run(host=LOG_SERVER_HOST, port=LOG_SERVER_PORT, threaded=True, use_reloader=False)
 
 
 def run_admin_server():
@@ -42,36 +32,29 @@ def run_admin_server():
 
 
 async def main():
-    logger.info("=== VPN Connection Checker Starting ===")
+    logger.info("=== Connection Limiter Starting ===")
     
     init_db()
     logger.info("Database initialized")
     
-    checker = ConnectionChecker()
-
-    # Graceful shutdown
-    def signal_handler(sig, frame):
-        logger.info("Shutting down...")
-        checker.stop()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # Запускаем Flask серверы в отдельных потоках
-    log_thread = threading.Thread(target=run_log_server, daemon=True)
-    log_thread.start()
-    logger.info(f"Log server started on port {LOG_SERVER_PORT}")
-    
+    # Start admin panel in thread
     admin_thread = threading.Thread(target=run_admin_server, daemon=True)
     admin_thread.start()
-    logger.info(f"Admin panel started on port {ADMIN_PORT}")
-
-    logger.info("Starting checker loop...")
+    logger.info(f"Admin panel: http://0.0.0.0:{ADMIN_PORT}")
     
-    # Запускаем async checker
-    await checker.start()
+    # Start async log server
+    server = LogServer()
+    await server.start()
+    logger.info(f"Log server: http://0.0.0.0:{LOG_SERVER_PORT}")
+    logger.info("Real-time violation detection ACTIVE")
+    
+    # Keep running
+    while True:
+        await asyncio.sleep(3600)
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
