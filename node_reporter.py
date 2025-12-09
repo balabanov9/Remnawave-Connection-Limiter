@@ -261,6 +261,35 @@ class BlockAPIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
         
+        elif self.path == '/clear_iptables':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            
+            try:
+                data = json.loads(body)
+                
+                if data.get('secret') != API_SECRET:
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                
+                # Clear all DROP rules in INPUT chain
+                subprocess.run(['iptables', '-F', 'INPUT'], capture_output=True)
+                with blocked_ips_lock:
+                    blocked_ips.clear()
+                
+                print("[CLEARED] All iptables INPUT rules")
+                
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"success": true}')
+                
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+        
         elif self.path == '/unblock_ip':
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length).decode('utf-8')
