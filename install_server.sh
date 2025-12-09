@@ -1,63 +1,89 @@
 #!/bin/bash
-
-# Установка Connection Limiter на центральный сервер
-# Запускать от root: bash install_server.sh
+# Connection Limiter - Server Installer
 
 set -e
+INSTALL_DIR="/opt/connection-limiter"
+REPO="https://github.com/balabanov9/Remnawave-Connection-Limiter.git"
 
-echo "=== Installing Remnawave Connection Limiter ==="
+echo "========================================"
+echo "  Connection Limiter - Server Setup"
+echo "========================================"
+echo ""
 
-# Проверяем что запущено от root
-if [ "$EUID" -ne 0 ]; then
-    echo "Please run as root"
-    exit 1
+[[ $EUID -ne 0 ]] && echo "Run as root!" && exit 1
+
+# Get settings
+read -p "Remnawave API URL: " API_URL
+read -p "Remnawave API Token: " API_TOKEN
+read -p "Telegram Bot Token (Enter to skip): " TG_TOKEN
+read -p "Telegram Chat ID (Enter to skip): " TG_CHAT
+read -p "Node API Secret: " NODE_SECRET
+
+echo ""
+echo "Enter nodes (name:ip), empty to finish:"
+NODES=""
+while read -p "Node: " node && [[ -n "$node" ]]; do
+    NODES="${NODES:+$NODES,}$node"
+done
+
+echo ""
+echo "Installing..."
+
+# Install deps
+apt-get update -qq && apt-get install -y -qq python3 python3-pip git >/dev/null
+
+# Clone/update
+if [[ -d "$INSTALL_DIR" ]]; then
+    cd "$INSTALL_DIR" && git fetch && git reset --hard origin/main
+else
+    git clone "$REPO" "$INSTALL_DIR"
 fi
 
-# Определяем путь к скрипту
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON_PATH=$(which python3)
+# Install Python deps
+pip3 install -q aiohttp requests
 
-echo "Script directory: $SCRIPT_DIR"
-echo "Python path: $PYTHON_PATH"
+# Create .env
+cat > "$INSTALL_DIR/.env" << EOF
+REMNAWAVE_API_URL=$API_URL
+REMNAWAVE_API_TOKEN=$API_TOKEN
+TELEGRAM_BOT_TOKEN=$TG_TOKEN
+TELEGRAM_CHAT_ID=$TG_CHAT
+NODE_API_SECRET=$NODE_SECRET
+NODES=$NODES
+DROP_DURATION_SECONDS=60
+IP_WINDOW_SECONDS=60
+EOF
 
-# Устанавливаем зависимости
-echo "Installing dependencies..."
-pip3 install -r "$SCRIPT_DIR/requirements.txt"
-
-# Создаем systemd сервис
-echo "Creating systemd service..."
+# Create service
 cat > /etc/systemd/system/connection-limiter.service << EOF
 [Unit]
-Description=Remnawave Connection Limiter
+Description=Connection Limiter
 After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=$SCRIPT_DIR
-ExecStart=$PYTHON_PATH main.py
+WorkingDirectory=$INSTALL_DIR
+ExecStart=/usr/bin/python3 server.py
 Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Перезагружаем systemd
 systemctl daemon-reload
-
-# Включаем и запускаем сервис
 systemctl enable connection-limiter
-systemctl start connection-limiter
+systemctl restart connection-limiter
 
+IP=$(hostname -I | awk '{print $1}')
 echo ""
-echo "=== Installation complete ==="
+echo "========================================"
+echo "  Done!"
+echo "========================================"
+echo "Admin: http://$IP:8080 (password: admin)"
+echo "Logs:  http://$IP:5000"
 echo ""
 echo "Commands:"
-echo "  systemctl status connection-limiter  - check status"
-echo "  systemctl restart connection-limiter - restart"
-echo "  journalctl -u connection-limiter -f  - view logs"
+echo "  systemctl status connection-limiter"
+echo "  journalctl -u connection-limiter -f"
 echo ""
-echo "Don't forget to edit config.py with your settings!"
