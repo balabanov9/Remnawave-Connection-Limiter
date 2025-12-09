@@ -14,8 +14,18 @@ class RemnawaveAPI:
         )
 
     async def get_user_by_username(self, username: str) -> UserResponseDto | None:
-        """Get user info by username"""
+        """Get user info by username or ID"""
         try:
+            # Сначала пробуем по ID (если username это число)
+            if username.isdigit():
+                try:
+                    user = await self.client.users.get_user_by_id(username)
+                    if user:
+                        return user
+                except:
+                    pass
+            
+            # Потом по username
             user = await self.client.users.get_user_by_username(username)
             return user
         except Exception as e:
