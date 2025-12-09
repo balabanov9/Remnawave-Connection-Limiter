@@ -17,7 +17,7 @@ LOG_SERVER_URL = "http://your-server:5000/log"  # URL центрального �
 NODE_NAME = "node-1"  # Имя этой ноды
 XRAY_LOG_PATH = "/var/log/xray/access.log"  # Путь к логам Xray
 STATE_FILE = "/tmp/node_reporter_state.json"  # Файл для сохранения позиции
-READ_INTERVAL = 60  # Читать лог каждые 60 секунд
+READ_INTERVAL = 10  # Читать лог каждые 10 секунд
 
 # API server for receiving block commands
 API_PORT = 5001  # Порт для приема команд блокировки

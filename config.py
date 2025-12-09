@@ -9,8 +9,8 @@ LOG_SERVER_HOST = "0.0.0.0"
 LOG_SERVER_PORT = 5000
 
 # Check settings
-CHECK_INTERVAL_SECONDS = 120  # Проверка каждые 2 минуты
-IP_WINDOW_SECONDS = 120  # Окно времени для подсчета уникальных IP (2 минуты)
+CHECK_INTERVAL_SECONDS = 30  # Проверка каждые 30 секунд
+IP_WINDOW_SECONDS = 60  # Окно времени для подсчета уникальных IP (1 минута)
 DROP_DURATION_SECONDS = 60  # На сколько дропать соединение (1 минута)
 
 # Database
