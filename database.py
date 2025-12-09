@@ -240,3 +240,39 @@ def get_db_stats() -> dict:
     return {
         "total_connections": total_connections
     }
+
+
+def get_users_with_multiple_ips() -> list:
+    """Get users who have more than 1 unique IP - returns [(username, [(ip, port), ...]), ...]"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cutoff_time = int(time.time()) - IP_WINDOW_SECONDS
+    
+    # First get users with >1 unique IP
+    cursor.execute('''
+        SELECT user_email, COUNT(DISTINCT ip_address) as ip_count
+        FROM connections 
+        WHERE timestamp > ?
+        GROUP BY user_email
+        HAVING ip_count > 1
+    ''', (cutoff_time,))
+    
+    users_with_multi_ip = [row[0] for row in cursor.fetchall()]
+    
+    if not users_with_multi_ip:
+        conn.close()
+        return []
+    
+    # Get IP:port data for these users
+    result = []
+    for username in users_with_multi_ip:
+        cursor.execute(
+            'SELECT DISTINCT ip_address, port FROM connections WHERE user_email = ? AND timestamp > ?',
+            (username, cutoff_time)
+        )
+        ip_data = [(row[0], row[1]) for row in cursor.fetchall()]
+        result.append((username, ip_data))
+    
+    conn.close()
+    return result

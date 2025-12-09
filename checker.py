@@ -1,4 +1,4 @@
-"""Main connection checker logic - simple IP drop version"""
+"""Main connection checker logic - optimized with parallel requests"""
 
 import asyncio
 import time
@@ -6,137 +6,157 @@ import logging
 import aiohttp
 from database import (
     init_db, get_all_active_users, get_unique_ips_with_ports,
-    cleanup_old_connections, get_db_stats
+    cleanup_old_connections, get_db_stats, get_users_with_multiple_ips
 )
-from remnawave_api import RemnawaveAPI
 from telegram_bot import notifier
-from events_log import log_drop, log_error, log_info
+from events_log import log_drop
 from config import (
     CHECK_INTERVAL_SECONDS, DROP_DURATION_SECONDS,
-    NODE_API_SECRET, NODE_API_PORT, NODES
+    NODE_API_SECRET, NODE_API_PORT, NODES,
+    REMNAWAVE_API_URL, REMNAWAVE_API_TOKEN
 )
 
 logger = logging.getLogger(__name__)
 
+# Cache for user limits (username -> (limit, timestamp))
+_limit_cache = {}
+CACHE_TTL = 300  # 5 minutes
+
 
 class ConnectionChecker:
     def __init__(self):
-        self.api = RemnawaveAPI()
         self.running = False
+        self.session = None
 
-    async def drop_ips_on_all_nodes(self, ip_port_list: list):
-        """Send drop commands to ALL nodes
-        ip_port_list: list of tuples (ip, port)
-        """
-        if not NODES:
-            logger.warning("NODES config is empty, cannot drop IPs")
-            return
-        
-        async with aiohttp.ClientSession() as session:
-            for node_name, node_ip in NODES.items():
-                for ip, port in ip_port_list:
-                    try:
-                        url = f"http://{node_ip}:{NODE_API_PORT}/block_ip"
-                        payload = {
-                            "ip": ip,
-                            "port": port,
-                            "duration": DROP_DURATION_SECONDS,
-                            "secret": NODE_API_SECRET
-                        }
-                        
-                        async with session.post(
-                            url,
-                            json=payload,
-                            timeout=aiohttp.ClientTimeout(total=5)
-                        ) as resp:
-                            block_key = f"{ip}:{port}" if port else ip
-                            if resp.status == 200:
-                                logger.info(f"DROP {block_key} on {node_name}")
-                            else:
-                                logger.warning(f"Failed to drop {block_key} on {node_name}: {resp.status}")
-                    except Exception as e:
-                        logger.warning(f"Could not reach node {node_name}: {e}")
+    async def get_session(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
 
-    async def check_user(self, username: str):
-        """Check user and drop excess connections if IP > HWID limit"""
-        # Получаем все IP:port для юзера
-        ip_port_list = get_unique_ips_with_ports(username)
+    async def get_user_limit(self, username: str) -> int | None:
+        """Get user HWID limit with caching"""
+        now = time.time()
         
-        if not ip_port_list:
-            return
+        # Check cache
+        if username in _limit_cache:
+            limit, ts = _limit_cache[username]
+            if now - ts < CACHE_TTL:
+                return limit
         
-        # Считаем уникальные IP (без портов)
-        unique_ips = list(set(ip for ip, port in ip_port_list))
+        # Fetch from API
+        try:
+            session = await self.get_session()
+            url = f"{REMNAWAVE_API_URL}/api/users/by-id/{username}"
+            headers = {"Authorization": f"Bearer {REMNAWAVE_API_TOKEN}"}
+            
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    user = data.get('response', data)
+                    limit = user.get('hwidDeviceLimit') or 0
+                    _limit_cache[username] = (limit, now)
+                    return limit if limit > 0 else None
+        except Exception as e:
+            logger.debug(f"API error for {username}: {e}")
+        
+        return None
+
+    async def check_user(self, username: str, ip_data: list):
+        """Check single user - ip_data is list of (ip, port) tuples"""
+        unique_ips = list(set(ip for ip, port in ip_data))
         ip_count = len(unique_ips)
         
-        # Получаем лимит устройств
-        device_limit = await self.api.get_user_hwid_limit(username)
+        if ip_count <= 1:
+            return
         
-        # Логируем для отладки если больше 1 IP
-        if ip_count > 1:
-            logger.info(f"User {username}: {ip_count} IPs, limit: {device_limit}")
+        # Get limit
+        device_limit = await self.get_user_limit(username)
+        
+        logger.info(f"User {username}: {ip_count} IPs, limit: {device_limit}")
         
         if device_limit is None or device_limit == 0:
-            # Нет лимита - пропускаем
-            if ip_count > 1:
-                logger.info(f"User {username}: no limit set, skipping")
             return
         
         if ip_count <= device_limit:
-            # Всё ок, в пределах лимита
             return
         
-        # Превышение! Дропаем лишние соединения
+        # Excess! Drop extra connections
         excess_count = ip_count - device_limit
         logger.warning(f"EXCESS! User {username}: {ip_count} IPs, limit: {device_limit}, dropping {excess_count}")
         
-        # Сортируем IP по количеству соединений (дропаем те что меньше соединений - скорее всего новые)
+        # Group by IP
         ip_connections = {}
-        for ip, port in ip_port_list:
+        for ip, port in ip_data:
             if ip not in ip_connections:
                 ip_connections[ip] = []
             ip_connections[ip].append((ip, port))
         
-        # Сортируем: сначала IP с меньшим количеством соединений
+        # Sort: drop IPs with fewer connections first (likely newer)
         sorted_ips = sorted(ip_connections.keys(), key=lambda x: len(ip_connections[x]))
-        
-        # Берём лишние IP для дропа
         ips_to_drop = sorted_ips[:excess_count]
         
-        # Собираем все IP:port для дропа
         connections_to_drop = []
         for ip in ips_to_drop:
             connections_to_drop.extend(ip_connections[ip])
         
-        logger.warning(f"DROP User {username}: dropping IPs {ips_to_drop}")
+        logger.warning(f"DROP User {username}: IPs {ips_to_drop}")
         
-        # Логируем событие для админки
         log_drop(username, ip_count, device_limit, ips_to_drop)
-        
-        # Отправляем в телеграм
         await notifier.notify_drop(username, ip_count, device_limit, ips_to_drop)
-        
-        # Дропаем на всех нодах
         await self.drop_ips_on_all_nodes(connections_to_drop)
 
-    async def run_check_cycle(self):
-        """Run one check cycle"""
-        logger.info(f"=== Check cycle at {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
-
-        active_users = get_all_active_users()
-        logger.info(f"Checking {len(active_users)} active users")
-
-        for username in active_users:
-            try:
-                await self.check_user(username)
-            except Exception as e:
-                logger.error(f"Error checking {username}: {e}")
-
-        # Очистка старых записей (держим 3 минуты для надёжности)
-        cleanup_old_connections(max_age_seconds=180)
+    async def drop_ips_on_all_nodes(self, ip_port_list: list):
+        """Send drop commands to all nodes in parallel"""
+        if not NODES or not ip_port_list:
+            return
         
+        session = await self.get_session()
+        tasks = []
+        
+        for node_name, node_ip in NODES.items():
+            for ip, port in ip_port_list:
+                tasks.append(self._drop_single(session, node_name, node_ip, ip, port))
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _drop_single(self, session, node_name, node_ip, ip, port):
+        try:
+            url = f"http://{node_ip}:{NODE_API_PORT}/block_ip"
+            payload = {"ip": ip, "port": port, "duration": DROP_DURATION_SECONDS, "secret": NODE_API_SECRET}
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                block_key = f"{ip}:{port}" if port else ip
+                if resp.status == 200:
+                    logger.info(f"DROP {block_key} on {node_name}")
+                else:
+                    logger.warning(f"Failed drop {block_key} on {node_name}: {resp.status}")
+        except:
+            pass
+
+    async def run_check_cycle(self):
+        """Run one check cycle - only check users with multiple IPs"""
+        start = time.time()
+        logger.info(f"=== Check cycle at {time.strftime('%H:%M:%S')} ===")
+
+        # Get only users with >1 unique IP (much faster)
+        users_data = get_users_with_multiple_ips()
+        
+        if not users_data:
+            logger.info("No users with multiple IPs")
+        else:
+            logger.info(f"Checking {len(users_data)} users with multiple IPs")
+            
+            # Check users in parallel batches
+            batch_size = 20
+            for i in range(0, len(users_data), batch_size):
+                batch = users_data[i:i+batch_size]
+                tasks = [self.check_user(username, ip_data) for username, ip_data in batch]
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        cleanup_old_connections(max_age_seconds=120)
+        
+        elapsed = time.time() - start
         stats = get_db_stats()
-        logger.info(f"DB stats: {stats['total_connections']} connections")
+        logger.info(f"Cycle done in {elapsed:.1f}s, DB: {stats['total_connections']} connections")
 
     async def start(self):
         """Start the checker loop"""
@@ -152,8 +172,10 @@ class ConnectionChecker:
                 logger.error(f"Check cycle error: {e}")
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
-    def stop(self):
+    async def stop(self):
         self.running = False
+        if self.session:
+            await self.session.close()
         logger.info("Connection checker stopped")
 
 
