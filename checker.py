@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import logging
 import aiohttp
 from database import (
     init_db, get_all_active_users, get_unique_ips_with_ports,
@@ -15,6 +16,8 @@ from config import (
     NODE_API_SECRET, NODE_API_PORT, NODES
 )
 
+logger = logging.getLogger(__name__)
+
 
 class ConnectionChecker:
     def __init__(self):
@@ -26,7 +29,7 @@ class ConnectionChecker:
         ip_port_list: list of tuples (ip, port)
         """
         if not NODES:
-            print("[WARN] NODES config is empty, cannot drop IPs")
+            logger.warning("NODES config is empty, cannot drop IPs")
             return
         
         async with aiohttp.ClientSession() as session:
@@ -48,11 +51,11 @@ class ConnectionChecker:
                         ) as resp:
                             block_key = f"{ip}:{port}" if port else ip
                             if resp.status == 200:
-                                print(f"[DROP] {block_key} on {node_name}")
+                                logger.info(f"DROP {block_key} on {node_name}")
                             else:
-                                print(f"[WARN] Failed to drop {block_key} on {node_name}: {resp.status}")
+                                logger.warning(f"Failed to drop {block_key} on {node_name}: {resp.status}")
                     except Exception as e:
-                        print(f"[WARN] Could not reach node {node_name}: {e}")
+                        logger.warning(f"Could not reach node {node_name}: {e}")
 
     async def check_user(self, username: str):
         """Check user and drop excess connections if IP > HWID limit"""
@@ -71,10 +74,12 @@ class ConnectionChecker:
         
         # Логируем для отладки если больше 1 IP
         if ip_count > 1:
-            print(f"[CHECK] User {username}: {ip_count} IPs, limit: {device_limit}")
+            logger.info(f"User {username}: {ip_count} IPs, limit: {device_limit}")
         
         if device_limit is None or device_limit == 0:
             # Нет лимита - пропускаем
+            if ip_count > 1:
+                logger.info(f"User {username}: no limit set, skipping")
             return
         
         if ip_count <= device_limit:
@@ -83,7 +88,7 @@ class ConnectionChecker:
         
         # Превышение! Дропаем лишние соединения
         excess_count = ip_count - device_limit
-        print(f"[EXCESS] User {username}: {ip_count} IPs, limit: {device_limit}, dropping {excess_count}")
+        logger.warning(f"EXCESS! User {username}: {ip_count} IPs, limit: {device_limit}, dropping {excess_count}")
         
         # Сортируем IP по количеству соединений (дропаем те что меньше соединений - скорее всего новые)
         ip_connections = {}
@@ -103,7 +108,7 @@ class ConnectionChecker:
         for ip in ips_to_drop:
             connections_to_drop.extend(ip_connections[ip])
         
-        print(f"[DROP] User {username}: dropping IPs {ips_to_drop}")
+        logger.warning(f"DROP User {username}: dropping IPs {ips_to_drop}")
         
         # Логируем событие для админки
         log_drop(username, ip_count, device_limit, ips_to_drop)
@@ -116,40 +121,40 @@ class ConnectionChecker:
 
     async def run_check_cycle(self):
         """Run one check cycle"""
-        print(f"[CYCLE] Check at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"=== Check cycle at {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
 
         active_users = get_all_active_users()
-        print(f"[CYCLE] Checking {len(active_users)} active users")
+        logger.info(f"Checking {len(active_users)} active users")
 
         for username in active_users:
             try:
                 await self.check_user(username)
             except Exception as e:
-                print(f"[ERROR] Error checking {username}: {e}")
+                logger.error(f"Error checking {username}: {e}")
 
         # Очистка старых записей (держим 3 минуты для надёжности)
         cleanup_old_connections(max_age_seconds=180)
         
         stats = get_db_stats()
-        print(f"[STATS] DB: {stats['total_connections']} connections")
+        logger.info(f"DB stats: {stats['total_connections']} connections")
 
     async def start(self):
         """Start the checker loop"""
         self.running = True
         init_db()
-        print("[START] Connection checker started")
-        print(f"[CONFIG] Check interval: {CHECK_INTERVAL_SECONDS}s")
+        logger.info("Connection checker started")
+        logger.info(f"Check interval: {CHECK_INTERVAL_SECONDS}s")
 
         while self.running:
             try:
                 await self.run_check_cycle()
             except Exception as e:
-                print(f"[ERROR] Check cycle error: {e}")
+                logger.error(f"Check cycle error: {e}")
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
     def stop(self):
         self.running = False
-        print("[STOP] Connection checker stopped")
+        logger.info("Connection checker stopped")
 
 
 async def run_checker():

@@ -4,6 +4,15 @@ import asyncio
 import signal
 import sys
 import threading
+import logging
+
+# Настраиваем логирование в stderr чтобы видеть в journalctl
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stderr)]
+)
+logger = logging.getLogger(__name__)
 
 # Start log capture FIRST before any imports that might print
 from events_log import start_capture
@@ -20,21 +29,29 @@ ADMIN_PORT = 8080
 
 def run_log_server():
     """Run log server Flask in a separate thread"""
+    import logging as flask_log
+    flask_log.getLogger('werkzeug').setLevel(flask_log.WARNING)
     log_app.run(host=LOG_SERVER_HOST, port=LOG_SERVER_PORT, threaded=True, use_reloader=False)
 
 
 def run_admin_server():
     """Run admin panel Flask in a separate thread"""
+    import logging as flask_log
+    flask_log.getLogger('werkzeug').setLevel(flask_log.WARNING)
     admin_app.run(host='0.0.0.0', port=ADMIN_PORT, threaded=True, use_reloader=False)
 
 
 async def main():
+    logger.info("=== VPN Connection Checker Starting ===")
+    
     init_db()
+    logger.info("Database initialized")
+    
     checker = ConnectionChecker()
 
     # Graceful shutdown
     def signal_handler(sig, frame):
-        print("\n[SHUTDOWN] Shutting down...")
+        logger.info("Shutting down...")
         checker.stop()
         sys.exit(0)
 
@@ -44,14 +61,14 @@ async def main():
     # Запускаем Flask серверы в отдельных потоках
     log_thread = threading.Thread(target=run_log_server, daemon=True)
     log_thread.start()
+    logger.info(f"Log server started on port {LOG_SERVER_PORT}")
     
     admin_thread = threading.Thread(target=run_admin_server, daemon=True)
     admin_thread.start()
+    logger.info(f"Admin panel started on port {ADMIN_PORT}")
 
-    print("[MAIN] VPN Connection Checker started")
-    print(f"[MAIN] Log server: http://{LOG_SERVER_HOST}:{LOG_SERVER_PORT}")
-    print(f"[MAIN] Admin panel: http://0.0.0.0:{ADMIN_PORT}")
-
+    logger.info("Starting checker loop...")
+    
     # Запускаем async checker
     await checker.start()
 
