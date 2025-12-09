@@ -1,19 +1,17 @@
-"""Main connection checker logic (async version)"""
+"""Main connection checker logic - simple IP drop version"""
 
 import asyncio
 import time
 import aiohttp
 from database import (
-    init_db, get_all_active_users, get_unique_ips, get_unique_ips_with_ports,
-    add_blocked_user, get_users_to_unblock, remove_blocked_user,
-    is_user_blocked, cleanup_old_connections, get_db_stats
+    init_db, get_all_active_users, get_unique_ips_with_ports,
+    cleanup_old_connections, get_db_stats
 )
 from remnawave_api import RemnawaveAPI
 from telegram_bot import notifier
 from config import (
-    CHECK_INTERVAL_SECONDS, BLOCK_DURATION_SECONDS,
-    NODE_API_SECRET, NODE_API_PORT, KICK_IPS_ON_VIOLATION, NODES,
-    VIOLATION_CONFIRM_COUNT, KICK_BY_IP_PORT
+    CHECK_INTERVAL_SECONDS, DROP_DURATION_SECONDS,
+    NODE_API_SECRET, NODE_API_PORT, NODES
 )
 
 
@@ -21,19 +19,13 @@ class ConnectionChecker:
     def __init__(self):
         self.api = RemnawaveAPI()
         self.running = False
-        # Счётчик нарушений для каждого юзера {username: count}
-        # Нужно несколько подряд нарушений чтобы забанить
-        self.violation_counts = {}
 
-    async def kick_ips_from_all_nodes(self, ip_port_list: list):
-        """Send block commands to ALL nodes to kick IPs
-        ip_port_list: list of tuples (ip, port) - port can be None for IP-only block
+    async def drop_ips_on_all_nodes(self, ip_port_list: list):
+        """Send drop commands to ALL nodes
+        ip_port_list: list of tuples (ip, port)
         """
-        if not KICK_IPS_ON_VIOLATION:
-            return
-        
         if not NODES:
-            print("[WARN] NODES config is empty, cannot kick IPs")
+            print("[WARN] NODES config is empty, cannot drop IPs")
             return
         
         async with aiohttp.ClientSession() as session:
@@ -43,11 +35,10 @@ class ConnectionChecker:
                         url = f"http://{node_ip}:{NODE_API_PORT}/block_ip"
                         payload = {
                             "ip": ip,
-                            "duration": BLOCK_DURATION_SECONDS,
+                            "port": port,
+                            "duration": DROP_DURATION_SECONDS,
                             "secret": NODE_API_SECRET
                         }
-                        if port:
-                            payload["port"] = port
                         
                         async with session.post(
                             url,
@@ -56,100 +47,68 @@ class ConnectionChecker:
                         ) as resp:
                             block_key = f"{ip}:{port}" if port else ip
                             if resp.status == 200:
-                                print(f"[KICK] Blocked {block_key} on {node_name}")
+                                print(f"[DROP] {block_key} on {node_name}")
                             else:
-                                print(f"[WARN] Failed to block {block_key} on {node_name}: {resp.status}")
+                                print(f"[WARN] Failed to drop {block_key} on {node_name}: {resp.status}")
                     except Exception as e:
                         print(f"[WARN] Could not reach node {node_name}: {e}")
 
     async def check_user(self, username: str):
-        """Check single user for connection limit violation"""
-        if is_user_blocked(username):
-            # Сбрасываем счётчик для заблокированных
-            self.violation_counts.pop(username, None)
+        """Check user and drop excess connections if IP > HWID limit"""
+        # Получаем все IP:port для юзера
+        ip_port_list = get_unique_ips_with_ports(username)
+        
+        if not ip_port_list:
             return
-
-        unique_ips = get_unique_ips(username)
+        
+        # Считаем уникальные IP (без портов)
+        unique_ips = list(set(ip for ip, port in ip_port_list))
         ip_count = len(unique_ips)
-
-        if ip_count == 0:
-            # Нет активности — сбрасываем счётчик
-            self.violation_counts.pop(username, None)
+        
+        # Получаем лимит устройств
+        device_limit = await self.api.get_user_hwid_limit(username)
+        
+        if device_limit is None or device_limit == 0:
+            # Нет лимита - пропускаем
             return
-
-        device_limit = await self.api.get_user_device_limit(username)
-
-        if ip_count > device_limit:
-            # Увеличиваем счётчик нарушений
-            self.violation_counts[username] = self.violation_counts.get(username, 0) + 1
-            current_count = self.violation_counts[username]
-            
-            print(f"[CHECK] User {username}: {ip_count} IPs, limit: {device_limit}, violations: {current_count}/{VIOLATION_CONFIRM_COUNT}")
-            
-            # Проверяем достаточно ли нарушений подряд
-            if current_count < VIOLATION_CONFIRM_COUNT:
-                print(f"[WARN] User {username} exceeds limit, waiting for confirmation ({current_count}/{VIOLATION_CONFIRM_COUNT})")
-                return
-            
-            # Подтверждённое нарушение!
-            print(f"[VIOLATION] User {username} confirmed: {ip_count} IPs, limit: {device_limit}")
-            print(f"[VIOLATION] IPs: {unique_ips}")
-
-            # Сбрасываем счётчик
-            self.violation_counts.pop(username, None)
-
-            # Отправляем warning в телеграм
-            await notifier.notify_warning(username, ip_count, device_limit, unique_ips)
-
-            # Кикаем на ВСЕХ нодах
-            if KICK_BY_IP_PORT:
-                # Точечный бан по IP:port
-                ip_port_list = get_unique_ips_with_ports(username)
-            else:
-                # Бан по IP целиком
-                ip_port_list = [(ip, None) for ip in unique_ips]
-            await self.kick_ips_from_all_nodes(ip_port_list)
-
-            user_uuid = await self.api.get_user_uuid(username)
-            if not user_uuid:
-                print(f"[ERROR] Could not get UUID for user {username}")
-                return
-
-            current_status = await self.api.get_user_status(username)
-
-            if await self.api.disable_user(user_uuid):
-                blocked_until = int(time.time()) + BLOCK_DURATION_SECONDS
-                add_blocked_user(username, blocked_until, current_status)
-                print(f"[BLOCKED] User {username} for {BLOCK_DURATION_SECONDS}s")
-                
-                await notifier.notify_disabled(username)
-        else:
-            # Нет нарушения — сбрасываем счётчик
-            self.violation_counts.pop(username, None)
-
-    async def unblock_expired(self):
-        """Unblock users whose block time has expired"""
-        users_to_unblock = get_users_to_unblock()
-
-        for username, original_status in users_to_unblock:
-            print(f"[UNBLOCK] Unblocking user {username}")
-
-            user_uuid = await self.api.get_user_uuid(username)
-            if not user_uuid:
-                print(f"[ERROR] Could not get UUID for {username}")
-                remove_blocked_user(username)
-                continue
-
-            if await self.api.enable_user(user_uuid):
-                remove_blocked_user(username)
-                print(f"[UNBLOCKED] User {username} is now active")
-                await notifier.notify_enabled(username)
+        
+        if ip_count <= device_limit:
+            # Всё ок, в пределах лимита
+            return
+        
+        # Превышение! Дропаем лишние соединения
+        excess_count = ip_count - device_limit
+        print(f"[EXCESS] User {username}: {ip_count} IPs, limit: {device_limit}, dropping {excess_count}")
+        
+        # Сортируем IP по количеству соединений (дропаем те что меньше соединений - скорее всего новые)
+        ip_connections = {}
+        for ip, port in ip_port_list:
+            if ip not in ip_connections:
+                ip_connections[ip] = []
+            ip_connections[ip].append((ip, port))
+        
+        # Сортируем: сначала IP с меньшим количеством соединений
+        sorted_ips = sorted(ip_connections.keys(), key=lambda x: len(ip_connections[x]))
+        
+        # Берём лишние IP для дропа
+        ips_to_drop = sorted_ips[:excess_count]
+        
+        # Собираем все IP:port для дропа
+        connections_to_drop = []
+        for ip in ips_to_drop:
+            connections_to_drop.extend(ip_connections[ip])
+        
+        print(f"[DROP] User {username}: dropping IPs {ips_to_drop}")
+        
+        # Отправляем в телеграм
+        await notifier.notify_drop(username, ip_count, device_limit, ips_to_drop)
+        
+        # Дропаем на всех нодах
+        await self.drop_ips_on_all_nodes(connections_to_drop)
 
     async def run_check_cycle(self):
         """Run one check cycle"""
         print(f"[CYCLE] Check at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-        await self.unblock_expired()
 
         active_users = get_all_active_users()
         print(f"[CYCLE] Checking {len(active_users)} active users")
@@ -160,18 +119,18 @@ class ConnectionChecker:
             except Exception as e:
                 print(f"[ERROR] Error checking {username}: {e}")
 
-        # Очистка старых записей
-        cleanup_old_connections(max_age_seconds=120)
+        # Очистка старых записей (держим 3 минуты для надёжности)
+        cleanup_old_connections(max_age_seconds=180)
         
         stats = get_db_stats()
-        print(f"[STATS] DB: {stats['total_connections']} connections, {stats['blocked_users']} blocked, pending violations: {len(self.violation_counts)}")
+        print(f"[STATS] DB: {stats['total_connections']} connections")
 
     async def start(self):
         """Start the checker loop"""
         self.running = True
         init_db()
         print("[START] Connection checker started")
-        print(f"[CONFIG] Check interval: {CHECK_INTERVAL_SECONDS}s, Confirm count: {VIOLATION_CONFIRM_COUNT}")
+        print(f"[CONFIG] Check interval: {CHECK_INTERVAL_SECONDS}s")
 
         while self.running:
             try:

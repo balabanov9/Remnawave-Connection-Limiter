@@ -32,19 +32,13 @@ class RemnawaveAPI:
             return None
 
     async def get_user_device_limit(self, username: str) -> int:
-        """Get user's device limit (hwidDeviceLimit)"""
+        """Get user's device limit (hwidDeviceLimit) - legacy method"""
         user = await self.get_user_by_username(username)
         if user:
             limit = None
             
             try:
-                # Получаем все данные юзера
                 data = user.model_dump()
-                
-                # DEBUG: показать все поля (раскомментируй для отладки)
-                # print(f"[DEBUG] User {username} fields: {list(data.keys())}")
-                
-                # Ищем поле с лимитом устройств
                 for key in ['hwidDeviceLimit', 'hwid_device_limit', 'deviceLimit', 'device_limit']:
                     if key in data and data[key] is not None:
                         limit = data[key]
@@ -52,13 +46,38 @@ class RemnawaveAPI:
             except Exception as e:
                 print(f"[DEBUG] Error getting user data: {e}")
             
-            # Если лимит найден и > 0, возвращаем его
             if limit is not None and limit > 0:
                 return int(limit)
-            
-            # Если None или 0 — без лимита (пропускаем проверку)
             return 999
-        return 1  # По умолчанию 1 устройство если юзер не найден
+        return 1
+
+    async def get_user_hwid_limit(self, username: str) -> int | None:
+        """Get user's HWID device limit via /api/hwid/devices/{uuid}"""
+        user_uuid = await self.get_user_uuid(username)
+        if not user_uuid:
+            return None
+        
+        try:
+            # Используем прямой HTTP запрос к API
+            import aiohttp
+            url = f"{REMNAWAVE_API_URL}/api/hwid/devices/{user_uuid}"
+            headers = {"Authorization": f"Bearer {REMNAWAVE_API_TOKEN}"}
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        # Ищем лимит в ответе
+                        limit = data.get('response', {}).get('hwidDeviceLimit') or data.get('hwidDeviceLimit')
+                        if limit is not None and limit > 0:
+                            return int(limit)
+                        return None  # Нет лимита
+                    else:
+                        print(f"[ERROR] HWID API returned {resp.status} for {username}")
+                        return None
+        except Exception as e:
+            print(f"[ERROR] Failed to get HWID limit for {username}: {e}")
+            return None
 
     async def disable_user(self, uuid: str) -> bool:
         """Disable user subscription"""

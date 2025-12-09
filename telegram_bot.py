@@ -57,13 +57,17 @@ class TelegramNotifier:
         message = f"🟢 <b>Enabled user:</b> <code>{username}</code>"
         await self.send_message(message)
 
-    async def notify_violation(self, username: str, ip_count: int, device_limit: int, ips: list):
-        """Send full violation report: warning + disabled + enabled after timeout"""
-        # Warning message
-        await self.notify_warning(username, ip_count, device_limit, ips)
+    async def notify_drop(self, username: str, ip_count: int, device_limit: int, dropped_ips: list):
+        """Send notification about dropped connections"""
+        ips_formatted = ", ".join([f"'{ip}'" for ip in dropped_ips])
         
-        # Disabled message
-        await self.notify_disabled(username)
+        message = (
+            f"🔻 <b>Drop:</b> User <code>{username}</code>\n"
+            f"IPs: {ip_count}, Limit: {device_limit}\n"
+            f"Dropped: {{{ips_formatted}}}"
+        )
+        
+        await self.send_message(message)
 
 
 # Global instance

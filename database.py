@@ -28,14 +28,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # Колонка уже существует
     
-    # Таблица заблокированных юзеров
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS blocked_users (
-            user_email TEXT PRIMARY KEY,
-            blocked_until INTEGER NOT NULL,
-            original_status TEXT
-        )
-    ''')
+
     
     # Индексы для быстрого поиска
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_email ON connections(user_email)')
@@ -242,12 +235,8 @@ def get_db_stats() -> dict:
     cursor.execute('SELECT COUNT(*) FROM connections')
     total_connections = cursor.fetchone()[0]
     
-    cursor.execute('SELECT COUNT(*) FROM blocked_users')
-    blocked_users = cursor.fetchone()[0]
-    
     conn.close()
     
     return {
-        "total_connections": total_connections,
-        "blocked_users": blocked_users
+        "total_connections": total_connections
     }
