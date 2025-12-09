@@ -69,6 +69,10 @@ class ConnectionChecker:
         # Получаем лимит устройств
         device_limit = await self.api.get_user_hwid_limit(username)
         
+        # Логируем для отладки если больше 1 IP
+        if ip_count > 1:
+            print(f"[CHECK] User {username}: {ip_count} IPs, limit: {device_limit}")
+        
         if device_limit is None or device_limit == 0:
             # Нет лимита - пропускаем
             return

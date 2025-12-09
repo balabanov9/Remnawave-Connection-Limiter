@@ -907,6 +907,35 @@ def debug_page():
     </div>
     
     <div class="card">
+        <h2>� Симiуляция нарушения</h2>
+        <p style="color: #aaa; margin-bottom: 15px;">Создаёт фейковые записи в БД чтобы проверить что система детектит нарушения и шлёт уведомления</p>
+        <form method="POST" action="/debug/simulate">
+            <div class="grid-2">
+                <div class="form-group">
+                    <label>User ID (из логов)</label>
+                    <input type="text" name="sim_user_id" placeholder="1234" required>
+                </div>
+                <div class="form-group">
+                    <label>Количество IP (больше лимита)</label>
+                    <input type="number" name="ip_count" value="3" min="2" max="10">
+                </div>
+            </div>
+            <button type="submit" class="btn btn-danger">🧪 Симулировать нарушение</button>
+        </form>
+        <p style="color: #666; margin-top: 10px; font-size: 12px;">
+            После симуляции подождите до следующего цикла проверки (см. интервал в настройках)
+        </p>
+    </div>
+    
+    <div class="card">
+        <h2>⚡ Принудительная проверка</h2>
+        <p style="color: #aaa; margin-bottom: 15px;">Запустить цикл проверки прямо сейчас (не ждать интервал)</p>
+        <form method="POST" action="/debug/force_check">
+            <button type="submit" class="btn">🔄 Запустить проверку</button>
+        </form>
+    </div>
+    
+    <div class="card">
         <h2>📡 Available API Endpoints</h2>
         <ul style="color: #aaa; line-height: 2;">
             <li><code>GET /api/users/by-id/{{id}}</code> - Get user by ID</li>
@@ -921,6 +950,61 @@ def debug_page():
     return render_template_string(ADMIN_HTML, content=content, tab='debug',
                                   message=request.args.get('message'),
                                   success=request.args.get('success', 'true') == 'true')
+
+
+@app.route('/debug/simulate', methods=['POST'])
+@login_required
+def simulate_violation():
+    """Simulate a violation by adding fake connections"""
+    user_id = request.form.get('sim_user_id', '').strip()
+    ip_count = int(request.form.get('ip_count', 3))
+    
+    if not user_id:
+        return redirect('/debug?message=Укажите User ID&success=false')
+    
+    try:
+        from database import log_connections_batch
+        
+        # Создаём фейковые соединения с разных IP
+        fake_connections = []
+        for i in range(ip_count):
+            fake_ip = f"192.168.{100+i}.{i+1}"
+            fake_port = str(10000 + i)
+            fake_connections.append((user_id, fake_ip, fake_port, "test-node"))
+        
+        log_connections_batch(fake_connections)
+        
+        return redirect(f'/debug?message=Добавлено {ip_count} фейковых IP для юзера {user_id}. Ждите проверку.&success=true')
+    except Exception as e:
+        return redirect(f'/debug?message=Ошибка: {e}&success=false')
+
+
+@app.route('/debug/force_check', methods=['POST'])
+@login_required
+def force_check():
+    """Force run a check cycle"""
+    try:
+        import asyncio
+        from checker import ConnectionChecker
+        
+        async def run_single_check():
+            checker = ConnectionChecker()
+            await checker.run_check_cycle()
+        
+        # Run in new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_single_check())
+        finally:
+            loop.close()
+        
+        return redirect('/debug?message=Проверка выполнена! Смотрите события на Dashboard&success=true')
+    except Exception as e:
+        import traceback
+        error = traceback.format_exc()
+        print(f"[ERROR] Force check failed: {error}")
+        return redirect(f'/debug?message=Ошибка: {e}&success=false')
 
 
 def run_admin(host='0.0.0.0', port=8080):
