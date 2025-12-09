@@ -442,22 +442,33 @@ SETTINGS_CONTENT = """
 """
 
 
+ENV_PATH = ".env"
+
+def parse_nodes_str(nodes_str: str) -> dict:
+    """Parse nodes from string: name1:ip1,name2:ip2"""
+    if not nodes_str:
+        return {}
+    result = {}
+    for item in nodes_str.split(','):
+        item = item.strip()
+        if ':' in item:
+            name, ip = item.split(':', 1)
+            result[name.strip()] = ip.strip()
+    return result
+
+def nodes_to_str(nodes: dict) -> str:
+    """Convert nodes dict to string"""
+    return ','.join(f"{k}:{v}" for k, v in nodes.items())
+
 def read_config():
-    """Read current config values"""
-    config = {}
-    try:
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-            exec(f.read(), config)
-    except Exception as e:
-        print(f"Error reading config: {e}")
-    
-    defaults = {
+    """Read config from .env file"""
+    config = {
         'REMNAWAVE_API_URL': 'http://localhost:3000',
         'REMNAWAVE_API_TOKEN': '',
         'LOG_SERVER_HOST': '0.0.0.0',
         'LOG_SERVER_PORT': 5000,
-        'CHECK_INTERVAL_SECONDS': 120,
-        'IP_WINDOW_SECONDS': 120,
+        'CHECK_INTERVAL_SECONDS': 10,
+        'IP_WINDOW_SECONDS': 60,
         'DROP_DURATION_SECONDS': 60,
         'DB_PATH': 'connections.db',
         'TELEGRAM_BOT_TOKEN': '',
@@ -467,46 +478,47 @@ def read_config():
         'NODES': {},
     }
     
-    for key, default in defaults.items():
-        if key not in config:
-            config[key] = default
+    try:
+        if os.path.exists(ENV_PATH):
+            with open(ENV_PATH, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        
+                        if key == 'NODES':
+                            config['NODES'] = parse_nodes_str(value)
+                        elif key in ('LOG_SERVER_PORT', 'CHECK_INTERVAL_SECONDS', 'IP_WINDOW_SECONDS', 
+                                     'DROP_DURATION_SECONDS', 'NODE_API_PORT'):
+                            config[key] = int(value) if value else config.get(key, 0)
+                        elif key in config:
+                            config[key] = value
+    except Exception as e:
+        print(f"Error reading .env: {e}")
     
     return config
 
 
 def write_config(config):
-    """Write config to file"""
-    content = '''"""Configuration for VPN connection checker"""
-
-# Remnawave API settings
-REMNAWAVE_API_URL = {REMNAWAVE_API_URL!r}
-REMNAWAVE_API_TOKEN = {REMNAWAVE_API_TOKEN!r}
-
-# Log collection settings
-LOG_SERVER_HOST = {LOG_SERVER_HOST!r}
-LOG_SERVER_PORT = {LOG_SERVER_PORT}
-
-# Check settings
-CHECK_INTERVAL_SECONDS = {CHECK_INTERVAL_SECONDS}
-IP_WINDOW_SECONDS = {IP_WINDOW_SECONDS}
-DROP_DURATION_SECONDS = {DROP_DURATION_SECONDS}
-
-# Database
-DB_PATH = {DB_PATH!r}
-
-# Telegram notifications
-TELEGRAM_BOT_TOKEN = {TELEGRAM_BOT_TOKEN!r}
-TELEGRAM_CHAT_ID = {TELEGRAM_CHAT_ID!r}
-
-# Node API settings
-NODE_API_PORT = {NODE_API_PORT}
-NODE_API_SECRET = {NODE_API_SECRET!r}
-
-# Nodes
-NODES = {NODES!r}
-'''.format(**config)
+    """Write config to .env file"""
+    nodes_str = nodes_to_str(config.get('NODES', {}))
     
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+    content = f"""REMNAWAVE_API_URL={config.get('REMNAWAVE_API_URL', '')}
+REMNAWAVE_API_TOKEN={config.get('REMNAWAVE_API_TOKEN', '')}
+TELEGRAM_BOT_TOKEN={config.get('TELEGRAM_BOT_TOKEN', '')}
+TELEGRAM_CHAT_ID={config.get('TELEGRAM_CHAT_ID', '')}
+NODE_API_SECRET={config.get('NODE_API_SECRET', '')}
+NODES={nodes_str}
+CHECK_INTERVAL_SECONDS={config.get('CHECK_INTERVAL_SECONDS', 10)}
+IP_WINDOW_SECONDS={config.get('IP_WINDOW_SECONDS', 60)}
+DROP_DURATION_SECONDS={config.get('DROP_DURATION_SECONDS', 60)}
+LOG_SERVER_PORT={config.get('LOG_SERVER_PORT', 5000)}
+NODE_API_PORT={config.get('NODE_API_PORT', 5001)}
+"""
+    
+    with open(ENV_PATH, 'w', encoding='utf-8') as f:
         f.write(content)
 
 
