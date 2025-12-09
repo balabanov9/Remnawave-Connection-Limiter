@@ -30,7 +30,7 @@ echo ""
 echo "Installing..."
 
 # Install deps
-apt-get update -qq && apt-get install -y -qq python3 python3-pip git >/dev/null
+apt-get update -qq && apt-get install -y -qq python3 python3-venv python3-pip git >/dev/null
 
 # Clone/update
 if [[ -d "$INSTALL_DIR" ]]; then
@@ -39,8 +39,9 @@ else
     git clone "$REPO" "$INSTALL_DIR"
 fi
 
-# Install Python deps
-pip3 install -q aiohttp requests
+# Create venv and install deps
+python3 -m venv "$INSTALL_DIR/venv"
+"$INSTALL_DIR/venv/bin/pip" install -q aiohttp requests
 
 # Create .env
 cat > "$INSTALL_DIR/.env" << EOF
@@ -63,7 +64,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$INSTALL_DIR
-ExecStart=/usr/bin/python3 server.py
+ExecStart=$INSTALL_DIR/venv/bin/python server.py
 Restart=always
 RestartSec=3
 
