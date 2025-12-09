@@ -16,10 +16,17 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_email TEXT NOT NULL,
             ip_address TEXT NOT NULL,
+            port TEXT,
             node_name TEXT,
             timestamp INTEGER NOT NULL
         )
     ''')
+    
+    # Добавляем колонку port если её нет (для миграции)
+    try:
+        cursor.execute('ALTER TABLE connections ADD COLUMN port TEXT')
+    except sqlite3.OperationalError:
+        pass  # Колонка уже существует
     
     # Таблица заблокированных юзеров
     cursor.execute('''
@@ -38,14 +45,14 @@ def init_db():
     conn.close()
 
 
-def log_connection(user_email: str, ip_address: str, node_name: str = None):
+def log_connection(user_email: str, ip_address: str, port: str = None, node_name: str = None):
     """Log a new connection"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute(
-        'INSERT INTO connections (user_email, ip_address, node_name, timestamp) VALUES (?, ?, ?, ?)',
-        (user_email, ip_address, node_name, int(time.time()))
+        'INSERT INTO connections (user_email, ip_address, port, node_name, timestamp) VALUES (?, ?, ?, ?, ?)',
+        (user_email, ip_address, port, node_name, int(time.time()))
     )
     
     conn.commit()
@@ -53,7 +60,9 @@ def log_connection(user_email: str, ip_address: str, node_name: str = None):
 
 
 def log_connections_batch(connections: list):
-    """Log multiple connections at once (faster)"""
+    """Log multiple connections at once (faster)
+    connections: list of tuples (user_email, ip_address, port, node_name)
+    """
     if not connections:
         return
     
@@ -64,8 +73,8 @@ def log_connections_batch(connections: list):
     
     # Batch insert
     cursor.executemany(
-        'INSERT INTO connections (user_email, ip_address, node_name, timestamp) VALUES (?, ?, ?, ?)',
-        [(c[0], c[1], c[2], timestamp) for c in connections]
+        'INSERT INTO connections (user_email, ip_address, port, node_name, timestamp) VALUES (?, ?, ?, ?, ?)',
+        [(c[0], c[1], c[2], c[3], timestamp) for c in connections]
     )
     
     conn.commit()
@@ -88,6 +97,24 @@ def get_unique_ips(user_email: str) -> list:
     conn.close()
     
     return ips
+
+
+def get_unique_ips_with_ports(user_email: str) -> list:
+    """Get unique IP:port pairs for user within time window"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cutoff_time = int(time.time()) - IP_WINDOW_SECONDS
+    
+    cursor.execute(
+        'SELECT DISTINCT ip_address, port FROM connections WHERE user_email = ? AND timestamp > ?',
+        (user_email, cutoff_time)
+    )
+    
+    results = [(row[0], row[1]) for row in cursor.fetchall()]
+    conn.close()
+    
+    return results
 
 
 def get_all_active_users() -> list:

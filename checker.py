@@ -4,7 +4,7 @@ import asyncio
 import time
 import aiohttp
 from database import (
-    init_db, get_all_active_users, get_unique_ips,
+    init_db, get_all_active_users, get_unique_ips, get_unique_ips_with_ports,
     add_blocked_user, get_users_to_unblock, remove_blocked_user,
     is_user_blocked, cleanup_old_connections, get_db_stats
 )
@@ -13,7 +13,7 @@ from telegram_bot import notifier
 from config import (
     CHECK_INTERVAL_SECONDS, BLOCK_DURATION_SECONDS,
     NODE_API_SECRET, NODE_API_PORT, KICK_IPS_ON_VIOLATION, NODES,
-    VIOLATION_CONFIRM_COUNT
+    VIOLATION_CONFIRM_COUNT, KICK_BY_IP_PORT
 )
 
 
@@ -25,8 +25,10 @@ class ConnectionChecker:
         # Нужно несколько подряд нарушений чтобы забанить
         self.violation_counts = {}
 
-    async def kick_ips_from_all_nodes(self, ips: list):
-        """Send block commands to ALL nodes to kick IPs"""
+    async def kick_ips_from_all_nodes(self, ip_port_list: list):
+        """Send block commands to ALL nodes to kick IPs
+        ip_port_list: list of tuples (ip, port) - port can be None for IP-only block
+        """
         if not KICK_IPS_ON_VIOLATION:
             return
         
@@ -36,22 +38,27 @@ class ConnectionChecker:
         
         async with aiohttp.ClientSession() as session:
             for node_name, node_ip in NODES.items():
-                for ip in ips:
+                for ip, port in ip_port_list:
                     try:
                         url = f"http://{node_ip}:{NODE_API_PORT}/block_ip"
+                        payload = {
+                            "ip": ip,
+                            "duration": BLOCK_DURATION_SECONDS,
+                            "secret": NODE_API_SECRET
+                        }
+                        if port:
+                            payload["port"] = port
+                        
                         async with session.post(
                             url,
-                            json={
-                                "ip": ip,
-                                "duration": BLOCK_DURATION_SECONDS,
-                                "secret": NODE_API_SECRET
-                            },
+                            json=payload,
                             timeout=aiohttp.ClientTimeout(total=5)
                         ) as resp:
+                            block_key = f"{ip}:{port}" if port else ip
                             if resp.status == 200:
-                                print(f"[KICK] Blocked {ip} on {node_name}")
+                                print(f"[KICK] Blocked {block_key} on {node_name}")
                             else:
-                                print(f"[WARN] Failed to block {ip} on {node_name}: {resp.status}")
+                                print(f"[WARN] Failed to block {block_key} on {node_name}: {resp.status}")
                     except Exception as e:
                         print(f"[WARN] Could not reach node {node_name}: {e}")
 
@@ -94,8 +101,14 @@ class ConnectionChecker:
             # Отправляем warning в телеграм
             await notifier.notify_warning(username, ip_count, device_limit, unique_ips)
 
-            # Кикаем IP на ВСЕХ нодах
-            await self.kick_ips_from_all_nodes(unique_ips)
+            # Кикаем на ВСЕХ нодах
+            if KICK_BY_IP_PORT:
+                # Точечный бан по IP:port
+                ip_port_list = get_unique_ips_with_ports(username)
+            else:
+                # Бан по IP целиком
+                ip_port_list = [(ip, None) for ip in unique_ips]
+            await self.kick_ips_from_all_nodes(ip_port_list)
 
             user_uuid = await self.api.get_user_uuid(username)
             if not user_uuid:

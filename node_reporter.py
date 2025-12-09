@@ -57,19 +57,20 @@ def get_file_inode(filepath: str) -> int:
 
 
 def parse_xray_log_line(line: str) -> tuple:
-    """Parse Xray access log line"""
-    ip_pattern = r'from (\d+\.\d+\.\d+\.\d+):\d+'
+    """Parse Xray access log line, returns (username, ip, port)"""
+    ip_port_pattern = r'from (?:tcp:)?(\d+\.\d+\.\d+\.\d+):(\d+)'
     email_pattern = r'email:\s*(\S+)'
     
-    ip_match = re.search(ip_pattern, line)
+    ip_match = re.search(ip_port_pattern, line)
     email_match = re.search(email_pattern, line)
     
     if ip_match and email_match:
         ip = ip_match.group(1)
+        port = ip_match.group(2)
         username = email_match.group(1)
-        return username, ip
+        return username, ip, port
     
-    return None, None
+    return None, None, None
 
 
 def report_connections(connections: list):
@@ -119,11 +120,12 @@ def read_new_lines():
             f.seek(state["position"])
             
             for line in f:
-                username, ip = parse_xray_log_line(line.strip())
+                username, ip, port = parse_xray_log_line(line.strip())
                 if username and ip:
                     connections.append({
                         "user_email": username,
                         "ip_address": ip,
+                        "port": port,
                         "node_name": NODE_NAME
                     })
             
@@ -135,11 +137,11 @@ def read_new_lines():
     
     save_state(new_position, current_inode)
     
-    # Deduplicate
+    # Deduplicate by user:ip:port
     seen = set()
     unique_connections = []
     for conn in connections:
-        key = f"{conn['user_email']}:{conn['ip_address']}"
+        key = f"{conn['user_email']}:{conn['ip_address']}:{conn['port']}"
         if key not in seen:
             seen.add(key)
             unique_connections.append(conn)
@@ -149,47 +151,51 @@ def read_new_lines():
 
 # ============ IP BLOCKING ============
 
-def block_ip(ip: str, duration: int = 120):
-    """Block IP using iptables"""
+def block_ip(ip: str, port: str = None, duration: int = 120):
+    """Block IP or IP:port using iptables"""
     try:
-        # Check if already blocked
-        result = subprocess.run(
-            ['iptables', '-C', 'INPUT', '-s', ip, '-j', 'DROP'],
-            capture_output=True
-        )
+        if port:
+            # Block specific IP:port (source port)
+            check_cmd = ['iptables', '-C', 'INPUT', '-s', ip, '--sport', port, '-j', 'DROP']
+            add_cmd = ['iptables', '-A', 'INPUT', '-s', ip, '-p', 'tcp', '--sport', port, '-j', 'DROP']
+            block_key = f"{ip}:{port}"
+        else:
+            # Block entire IP
+            check_cmd = ['iptables', '-C', 'INPUT', '-s', ip, '-j', 'DROP']
+            add_cmd = ['iptables', '-A', 'INPUT', '-s', ip, '-j', 'DROP']
+            block_key = ip
+        
+        result = subprocess.run(check_cmd, capture_output=True)
         
         if result.returncode != 0:
-            # Not blocked, add rule
-            subprocess.run(
-                ['iptables', '-A', 'INPUT', '-s', ip, '-j', 'DROP'],
-                check=True
-            )
-            print(f"[BLOCKED] IP {ip} for {duration}s")
+            subprocess.run(add_cmd, check=True)
+            print(f"[BLOCKED] {block_key} for {duration}s")
         else:
-            print(f"[INFO] IP {ip} already blocked")
+            print(f"[INFO] {block_key} already blocked")
         
-        # Schedule unblock
         with blocked_ips_lock:
-            blocked_ips[ip] = time.time() + duration
+            blocked_ips[block_key] = time.time() + duration
         
         return True
     except Exception as e:
-        print(f"[ERROR] Failed to block IP {ip}: {e}")
+        print(f"[ERROR] Failed to block {ip}:{port}: {e}")
         return False
 
 
-def unblock_ip(ip: str):
-    """Unblock IP"""
+def unblock_ip(ip: str, port: str = None):
+    """Unblock IP or IP:port"""
     try:
-        subprocess.run(
-            ['iptables', '-D', 'INPUT', '-s', ip, '-j', 'DROP'],
-            check=True,
-            capture_output=True
-        )
-        print(f"[UNBLOCKED] IP {ip}")
+        if port:
+            cmd = ['iptables', '-D', 'INPUT', '-s', ip, '-p', 'tcp', '--sport', port, '-j', 'DROP']
+            block_key = f"{ip}:{port}"
+        else:
+            cmd = ['iptables', '-D', 'INPUT', '-s', ip, '-j', 'DROP']
+            block_key = ip
+        
+        subprocess.run(cmd, check=True, capture_output=True)
+        print(f"[UNBLOCKED] {block_key}")
         return True
     except Exception as e:
-        # Rule might not exist
         return False
 
 
@@ -199,13 +205,17 @@ def cleanup_expired_blocks():
     to_unblock = []
     
     with blocked_ips_lock:
-        for ip, unblock_time in list(blocked_ips.items()):
+        for block_key, unblock_time in list(blocked_ips.items()):
             if current_time >= unblock_time:
-                to_unblock.append(ip)
-                del blocked_ips[ip]
+                to_unblock.append(block_key)
+                del blocked_ips[block_key]
     
-    for ip in to_unblock:
-        unblock_ip(ip)
+    for block_key in to_unblock:
+        if ':' in block_key:
+            ip, port = block_key.split(':', 1)
+            unblock_ip(ip, port)
+        else:
+            unblock_ip(block_key)
 
 
 # ============ HTTP API SERVER ============
@@ -230,6 +240,7 @@ class BlockAPIHandler(BaseHTTPRequestHandler):
                     return
                 
                 ip = data.get('ip')
+                port = data.get('port')  # Optional - if provided, block IP:port
                 duration = data.get('duration', 120)
                 
                 if not ip:
@@ -238,7 +249,7 @@ class BlockAPIHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b'{"error": "Missing ip"}')
                     return
                 
-                success = block_ip(ip, duration)
+                success = block_ip(ip, port, duration)
                 
                 self.send_response(200 if success else 500)
                 self.send_header('Content-Type', 'application/json')
@@ -263,10 +274,12 @@ class BlockAPIHandler(BaseHTTPRequestHandler):
                     return
                 
                 ip = data.get('ip')
+                port = data.get('port')
                 if ip:
-                    unblock_ip(ip)
+                    unblock_ip(ip, port)
+                    block_key = f"{ip}:{port}" if port else ip
                     with blocked_ips_lock:
-                        blocked_ips.pop(ip, None)
+                        blocked_ips.pop(block_key, None)
                 
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')

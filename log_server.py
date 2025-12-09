@@ -32,7 +32,8 @@ def receive_log():
         if not user_email or not ip_address:
             return jsonify({'error': 'Missing user_email or ip_address'}), 400
         
-        log_connection(user_email, ip_address, node_name)
+        port = data.get('port')
+        log_connection(user_email, ip_address, port, node_name)
         
         return jsonify({'status': 'ok'}), 200
         
@@ -70,10 +71,11 @@ def receive_log_batch():
         for conn in connections:
             user_email = conn.get('user_email')
             ip_address = conn.get('ip_address')
+            port = conn.get('port')
             node_name = conn.get('node_name', 'unknown')
             
             if user_email and ip_address:
-                valid_connections.append((user_email, ip_address, node_name))
+                valid_connections.append((user_email, ip_address, port, node_name))
         
         if valid_connections:
             log_connections_batch(valid_connections)

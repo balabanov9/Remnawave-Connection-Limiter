@@ -23,6 +23,7 @@ TELEGRAM_CHAT_ID = ""  # Твой Telegram ID (узнать через @getmyid_
 
 # IP Kick settings (принудительный разрыв соединений)
 KICK_IPS_ON_VIOLATION = False  # Включить кик IP через iptables на нодах
+KICK_BY_IP_PORT = True  # True = банить IP:port (точечно), False = банить весь IP
 NODE_API_PORT = 5001  # Порт API на нодах для приема команд блокировки
 NODE_API_SECRET = "change_this_secret"  # Секретный ключ (должен совпадать на нодах)
 
