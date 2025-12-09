@@ -52,29 +52,20 @@ class RemnawaveAPI:
         return 1
 
     async def get_user_hwid_limit(self, username: str) -> int | None:
-        """Get user's HWID device limit via /api/hwid/devices/{uuid}"""
-        user_uuid = await self.get_user_uuid(username)
-        if not user_uuid:
+        """Get user's HWID device limit from user data"""
+        user = await self.get_user_by_username(username)
+        if not user:
             return None
         
         try:
-            # Используем прямой HTTP запрос к API
-            import aiohttp
-            url = f"{REMNAWAVE_API_URL}/api/hwid/devices/{user_uuid}"
-            headers = {"Authorization": f"Bearer {REMNAWAVE_API_TOKEN}"}
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        # Ищем лимит в ответе
-                        limit = data.get('response', {}).get('hwidDeviceLimit') or data.get('hwidDeviceLimit')
-                        if limit is not None and limit > 0:
-                            return int(limit)
-                        return None  # Нет лимита
-                    else:
-                        print(f"[ERROR] HWID API returned {resp.status} for {username}")
-                        return None
+            data = user.model_dump()
+            # Ищем поле с лимитом устройств
+            for key in ['hwidDeviceLimit', 'hwid_device_limit', 'deviceLimit', 'device_limit']:
+                if key in data and data[key] is not None:
+                    limit = data[key]
+                    if limit > 0:
+                        return int(limit)
+            return None  # Нет лимита или 0
         except Exception as e:
             print(f"[ERROR] Failed to get HWID limit for {username}: {e}")
             return None
