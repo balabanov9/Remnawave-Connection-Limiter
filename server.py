@@ -295,16 +295,37 @@ async def enable_user_subscription(user_id):
 
 async def send_telegram(text):
     token = cfg('TELEGRAM_BOT_TOKEN')
-    chat = cfg('TELEGRAM_CHAT_ID')
-    if not token or not chat:
+    chat1 = cfg('TELEGRAM_CHAT_ID')
+    chat2 = cfg('TELEGRAM_CHAT_ID_2')
+    if not token:
         return False
     try:
         s = await get_http()
-        await s.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={"chat_id": chat, "text": text, "parse_mode": "HTML"})
+        # Send to first chat
+        if chat1:
+            await s.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat1, "text": text, "parse_mode": "HTML"})
+        # Send to second chat if configured
+        if chat2:
+            await s.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat2, "text": text, "parse_mode": "HTML"})
         return True
     except:
         return False
+
+async def get_bot_username():
+    token = cfg('TELEGRAM_BOT_TOKEN')
+    if not token:
+        return None
+    try:
+        s = await get_http()
+        async with s.get(f"https://api.telegram.org/bot{token}/getMe") as r:
+            if r.status == 200:
+                data = await r.json()
+                return data.get('result', {}).get('username')
+    except:
+        pass
+    return None
 
 async def drop_ip_on_all_nodes(ip):
     nodes = get_nodes()
@@ -771,6 +792,10 @@ async def page_settings(req):
     msg = req.query.get('msg', '')
     alert = f'<div class="alert alert-ok">{msg}</div>' if msg else ''
     
+    # Get bot username
+    bot_username = await get_bot_username()
+    bot_info = f'<span class="badge badge-ok">@{bot_username}</span>' if bot_username else '<span class="badge badge-warn">Not configured</span>'
+    
     content = f'''{alert}<form method="POST" action="/action/save_settings">
 <div class="card"><h2>🔗 Remnawave API</h2>
 <label>API URL</label><input name="REMNAWAVE_API_URL" value="{cfg('REMNAWAVE_API_URL')}" placeholder="https://panel.example.com">
@@ -778,8 +803,12 @@ async def page_settings(req):
 <label>API Token</label><input name="REMNAWAVE_API_TOKEN" value="{cfg('REMNAWAVE_API_TOKEN')}" type="password" placeholder="JWT token"></div>
 
 <div class="card"><h2>📱 Telegram</h2>
+<div style="margin-bottom:16px">Bot: {bot_info}</div>
 <label>Bot Token</label><input name="TELEGRAM_BOT_TOKEN" value="{cfg('TELEGRAM_BOT_TOKEN')}" placeholder="123456789:ABC...">
-<label>Chat ID</label><input name="TELEGRAM_CHAT_ID" value="{cfg('TELEGRAM_CHAT_ID')}" placeholder="123456789"></div>
+<div class="form-row">
+<div><label>Chat ID 1</label><input name="TELEGRAM_CHAT_ID" value="{cfg('TELEGRAM_CHAT_ID')}" placeholder="123456789"></div>
+<div><label>Chat ID 2 (optional)</label><input name="TELEGRAM_CHAT_ID_2" value="{cfg('TELEGRAM_CHAT_ID_2')}" placeholder="123456789"></div>
+</div></div>
 
 <div class="card"><h2>⚙️ Detection</h2>
 <div class="form-row">
@@ -834,6 +863,7 @@ async def action_save_settings(req):
         'REMNAWAVE_API_TOKEN': data.get('REMNAWAVE_API_TOKEN', ''),
         'TELEGRAM_BOT_TOKEN': data.get('TELEGRAM_BOT_TOKEN', ''),
         'TELEGRAM_CHAT_ID': data.get('TELEGRAM_CHAT_ID', ''),
+        'TELEGRAM_CHAT_ID_2': data.get('TELEGRAM_CHAT_ID_2', ''),
         'NODE_API_SECRET': data.get('NODE_API_SECRET', ''),
         'IP_WINDOW_SECONDS': data.get('IP_WINDOW_SECONDS', '300'),
         'DROP_DURATION_SECONDS': data.get('DROP_DURATION_SECONDS', '600'),
