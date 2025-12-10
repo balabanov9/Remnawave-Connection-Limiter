@@ -314,7 +314,8 @@ async def handle_violation(user_id, ips, limit):
     
     drop_cooldown[user_id] = now
     disable_minutes = cfg_int('DISABLE_MINUTES', 10)
-    ips_to_drop = ips[limit:] if len(ips) > limit else ips[-1:]
+    drop_all = cfg('DROP_ALL_IPS', 'true').lower() == 'true'
+    ips_to_drop = ips if drop_all else (ips[limit:] if len(ips) > limit else ips[-1:])
     
     log(f"VIOLATION: User {user_id} has {len(ips)} IPs (limit {limit})", 'WARNING')
     add_event(f"🚨 User {user_id}: {len(ips)} IPs > limit {limit}",
@@ -696,6 +697,10 @@ async def page_settings(req):
 <div class="form-row">
 <div><label>Scan Interval (sec)</label><input name="SCAN_INTERVAL_SECONDS" value="{cfg_int('SCAN_INTERVAL_SECONDS',30)}" type="number"><div class="form-hint">Auto-scan frequency</div></div>
 <div><label>Node Secret</label><input name="NODE_API_SECRET" value="{cfg('NODE_API_SECRET')}" type="password"></div>
+</div>
+<div class="form-row">
+<div><label>Drop All IPs</label><select name="DROP_ALL_IPS"><option value="true" {"selected" if cfg('DROP_ALL_IPS','true').lower()=='true' else ""}>Yes - drop ALL IPs</option><option value="false" {"selected" if cfg('DROP_ALL_IPS','true').lower()=='false' else ""}>No - only excess IPs</option></select><div class="form-hint">Drop all IPs or only those exceeding limit</div></div>
+<div></div>
 </div></div>
 
 <div class="card"><h2>🔐 Password</h2>
@@ -739,6 +744,7 @@ async def action_save_settings(req):
         'DROP_COOLDOWN_SECONDS': data.get('DROP_COOLDOWN_SECONDS', '60'),
         'SCAN_INTERVAL_SECONDS': data.get('SCAN_INTERVAL_SECONDS', '30'),
         'DISABLE_MINUTES': data.get('DISABLE_MINUTES', '10'),
+        'DROP_ALL_IPS': data.get('DROP_ALL_IPS', 'true'),
     })
     save_env(env)
     if data.get('new_password'):
