@@ -119,16 +119,22 @@ class DB:
         return [r[0] for r in self.conn.execute(
             'SELECT DISTINCT ip FROM connections WHERE user=? AND ts>?', (user, cutoff))]
     
-    def get_user_subnets(self, user):
-        """Get unique /24 subnets for user (for handover detection)"""
-        ips = self.get_user_ips(user)
-        subnets = set()
-        for ip in ips:
-            # Get /24 subnet (first 3 octets)
-            parts = ip.split('.')
-            if len(parts) == 4:
-                subnets.add('.'.join(parts[:3]))
-        return list(subnets), ips
+    def get_concurrent_ips(self, user, window_seconds=60):
+        """Get IPs that were active within the same time window (concurrent connections)"""
+        now = int(time.time())
+        cutoff = now - window_seconds
+        
+        # Get IPs with their last seen timestamp
+        rows = self.conn.execute(
+            'SELECT ip, MAX(ts) as last_seen FROM connections WHERE user=? AND ts>? GROUP BY ip',
+            (user, now - cfg_int('IP_WINDOW_SECONDS', 300))
+        ).fetchall()
+        
+        # Filter to only IPs active in the concurrent window
+        concurrent = [ip for ip, ts in rows if ts >= cutoff]
+        all_ips = [ip for ip, ts in rows]
+        
+        return concurrent, all_ips
     
     def get_active_users(self):
         cutoff = int(time.time()) - cfg_int('IP_WINDOW_SECONDS', 300)
