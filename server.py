@@ -192,20 +192,47 @@ async def get_user_limit(user_id):
         log(f"API error: {e}", 'ERROR')
     return 0
 
+async def get_user_uuid(user_id):
+    """Get user UUID from user ID"""
+    api_url = cfg('REMNAWAVE_API_URL')
+    api_token = cfg('REMNAWAVE_API_TOKEN')
+    if not api_url or not api_token:
+        return None
+    
+    try:
+        s = await get_http()
+        url = f"{api_url.rstrip('/')}/api/users/by-id/{user_id}"
+        async with s.get(url, headers={"Authorization": f"Bearer {api_token}"}) as r:
+            if r.status == 200:
+                data = await r.json()
+                user_data = data.get('response', data)
+                return user_data.get('uuid')
+    except Exception as e:
+        log(f"Get UUID error: {e}", 'ERROR')
+    return None
+
 async def disable_user_subscription(user_id, minutes=10):
     api_url = cfg('REMNAWAVE_API_URL')
     api_token = cfg('REMNAWAVE_API_TOKEN')
     if not api_url or not api_token:
         return False
     
+    # Get user UUID first
+    uuid = await get_user_uuid(user_id)
+    if not uuid:
+        log(f"Cannot get UUID for user {user_id}", 'ERROR')
+        return False
+    
     try:
         s = await get_http()
-        url = f"{api_url.rstrip('/')}/api/users/{user_id}/disable"
+        url = f"{api_url.rstrip('/')}/api/users/{uuid}/actions/disable"
         async with s.post(url, headers={"Authorization": f"Bearer {api_token}"}) as r:
             if r.status == 200:
                 disabled_users[user_id] = time.time() + (minutes * 60)
-                log(f"Disabled user {user_id} for {minutes} min")
+                log(f"Disabled user {user_id} (UUID: {uuid[:8]}...) for {minutes} min")
                 return True
+            else:
+                log(f"Disable failed: {r.status}", 'ERROR')
     except Exception as e:
         log(f"Disable error: {e}", 'ERROR')
     return False
@@ -216,9 +243,13 @@ async def enable_user_subscription(user_id):
     if not api_url or not api_token:
         return False
     
+    uuid = await get_user_uuid(user_id)
+    if not uuid:
+        return False
+    
     try:
         s = await get_http()
-        url = f"{api_url.rstrip('/')}/api/users/{user_id}/enable"
+        url = f"{api_url.rstrip('/')}/api/users/{uuid}/actions/enable"
         async with s.post(url, headers={"Authorization": f"Bearer {api_token}"}) as r:
             if r.status == 200:
                 disabled_users.pop(user_id, None)
