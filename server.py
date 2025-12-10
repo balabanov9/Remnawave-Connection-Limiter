@@ -339,7 +339,7 @@ async def check_node_health(node_ip):
 
 
 # ============ VIOLATION HANDLING ============
-async def handle_violation(user_id, ips, limit):
+async def handle_violation(user_id, ips, limit, reason="IP_COUNT"):
     now = time.time()
     cooldown = cfg_int('DROP_COOLDOWN_SECONDS', 60)
     
@@ -351,8 +351,8 @@ async def handle_violation(user_id, ips, limit):
     drop_all = cfg('DROP_ALL_IPS', 'true').lower() == 'true'
     ips_to_drop = ips if drop_all else (ips[limit:] if len(ips) > limit else ips[-1:])
     
-    log(f"VIOLATION: User {user_id} has {len(ips)} IPs (limit {limit})", 'WARNING')
-    add_event(f"🚨 User {user_id}: {len(ips)} IPs > limit {limit}",
+    log(f"VIOLATION: User {user_id} - {reason}", 'WARNING')
+    add_event(f"🚨 User {user_id}: {reason}",
               f"Dropping: {', '.join(ips_to_drop)}", 'violation')
     
     await disable_user_subscription(user_id, disable_minutes)
@@ -371,10 +371,9 @@ async def handle_violation(user_id, ips, limit):
 
 def analyze_sharing(user_id, limit):
     """
-    EFFECTIVE sharing detection.
+    Multi-node sharing detection.
     
-    Rule: If user connects from 2+ different NODES within short time = SHARING
-    One person CANNOT be on two VPN servers at the same time.
+    Rule: If user connects from 2+ different NODES AND has more IPs than limit = SHARING
     """
     now = int(time.time())
     window = cfg_int('CONCURRENT_WINDOW', 30)
@@ -391,13 +390,9 @@ def analyze_sharing(user_id, limit):
     ips = [r[0] for r in rows]
     nodes = set(r[1] for r in rows if r[1])
     
-    # MAIN CHECK: Multiple nodes = 100% SHARING
-    if len(nodes) >= 2:
-        return True, ips, f"SHARING: {len(nodes)} nodes ({', '.join(nodes)})"
-    
-    # Secondary: Way too many IPs on single node
-    if len(ips) > limit + 2:
-        return True, ips, f"SHARING: {len(ips)} IPs (limit {limit})"
+    # Only flag if IPs exceed limit AND multiple nodes
+    if len(ips) > limit and len(nodes) >= 2:
+        return True, ips, f"MULTI-NODE: {len(ips)} IPs on {len(nodes)} nodes ({', '.join(nodes)})"
     
     return False, [], "ok"
 
@@ -410,14 +405,14 @@ async def check_user(user_id):
     all_ips = db.get_user_ips(user_id)
     if len(all_ips) > limit:
         log(f"IP limit exceeded for {user_id}: {len(all_ips)} > {limit}", 'WARNING')
-        return await handle_violation(user_id, all_ips, limit)
+        return await handle_violation(user_id, all_ips, limit, "IP_COUNT")
     
     # Method 2: Multi-node detection (if enabled)
     if cfg('SMART_DETECTION', 'true').lower() == 'true':
         is_sharing, ips, reason = analyze_sharing(user_id, limit)
         if is_sharing:
             log(f"Multi-node sharing for {user_id}: {reason}", 'WARNING')
-            return await handle_violation(user_id, ips, limit)
+            return await handle_violation(user_id, ips, limit, reason)
     
     return False
 
@@ -684,7 +679,25 @@ async def page_violators(req):
     if not rows:
         rows = '<tr><td colspan="6" style="color:var(--muted)">No users with multiple IPs</td></tr>'
     
-    content = f'''{alert}<div class="card"><h2>🚨 Users with Multiple IPs</h2>
+    # Disabled users table
+    disabled_rows = ''
+    now = time.time()
+    for uid, exp_time in disabled_users.items():
+        remaining = int(exp_time - now)
+        if remaining > 0:
+            mins = remaining // 60
+            secs = remaining % 60
+            disabled_rows += f'''<tr><td><strong>{uid}</strong></td><td>{mins}m {secs}s</td>
+            <td><form method="POST" action="/action/unban_user" style="display:inline"><input type="hidden" name="user" value="{uid}">
+            <button class="btn btn-sm btn-success">Unban</button></form></td></tr>'''
+    if not disabled_rows:
+        disabled_rows = '<tr><td colspan="3" style="color:var(--muted)">No disabled users</td></tr>'
+    
+    content = f'''{alert}<div class="card"><h2>🚫 Disabled Users</h2>
+<p style="color:var(--muted);font-size:13px;margin-bottom:16px">Users temporarily disabled due to violations. Will auto-enable after timeout.</p>
+<table><tr><th>User ID</th><th>Time Left</th><th>Action</th></tr>{disabled_rows}</table></div>
+
+<div class="card"><h2>🚨 Users with Multiple IPs</h2>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
 <p style="color:var(--muted);font-size:13px">Red = exceeds limit. Multi-node detection catches users on 2+ servers.</p>
 <a href="/export/violators.csv" class="btn btn-sm btn-ghost">📥 Export CSV</a>
@@ -928,6 +941,16 @@ async def action_check_user(req):
         return web.HTTPFound(f'/violators?msg={msg}')
     return web.HTTPFound('/violators')
 
+async def action_unban_user(req):
+    data = await req.post()
+    user_id = data.get('user', '').strip()
+    if user_id:
+        await enable_user_subscription(user_id)
+        log(f"Manual unban: {user_id}")
+        add_event(f"Manual unban: {user_id}", "", "info")
+        return web.HTTPFound(f'/violators?msg=User {user_id} unbanned')
+    return web.HTTPFound('/violators')
+
 async def export_violators_csv(req):
     if not await check_auth(req):
         return web.HTTPFound('/')
@@ -1023,6 +1046,7 @@ async def main():
     app.router.add_post('/action/clear_logs', action_clear_logs)
     app.router.add_post('/action/drop_user', action_drop_user)
     app.router.add_post('/action/check_user', action_check_user)
+    app.router.add_post('/action/unban_user', action_unban_user)
     app.router.add_get('/export/violators.csv', export_violators_csv)
     
     asyncio.create_task(scanner_task())
