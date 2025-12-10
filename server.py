@@ -119,6 +119,17 @@ class DB:
         return [r[0] for r in self.conn.execute(
             'SELECT DISTINCT ip FROM connections WHERE user=? AND ts>?', (user, cutoff))]
     
+    def get_user_subnets(self, user):
+        """Get unique /24 subnets for user (for handover detection)"""
+        ips = self.get_user_ips(user)
+        subnets = set()
+        for ip in ips:
+            # Get /24 subnet (first 3 octets)
+            parts = ip.split('.')
+            if len(parts) == 4:
+                subnets.add('.'.join(parts[:3]))
+        return list(subnets), ips
+    
     def get_active_users(self):
         cutoff = int(time.time()) - cfg_int('IP_WINDOW_SECONDS', 300)
         return [r[0] for r in self.conn.execute(
@@ -335,15 +346,44 @@ async def handle_violation(user_id, ips, limit):
     )
     return True
 
+def get_unique_subnets(ips):
+    """Get unique /24 subnets from IP list"""
+    subnets = set()
+    for ip in ips:
+        parts = ip.split('.')
+        if len(parts) == 4:
+            subnets.add('.'.join(parts[:3]))
+    return subnets
+
 async def check_user(user_id):
     ips = db.get_user_ips(user_id)
     if len(ips) <= 1:
         return False
+    
     limit = await get_user_limit(user_id)
     if limit <= 0:
         return False
-    if len(ips) <= limit:
-        return False
+    
+    # Handover Protection
+    handover_enabled = cfg('HANDOVER_PROTECTION', 'true').lower() == 'true'
+    
+    if handover_enabled:
+        # Count by subnets instead of IPs
+        subnets = get_unique_subnets(ips)
+        grace = cfg_int('HANDOVER_GRACE', 1)  # Allow +1 subnet for handover
+        
+        # If unique subnets <= limit + grace, it's likely handover
+        if len(subnets) <= limit + grace:
+            return False
+        
+        # Check if subnets exceed limit (real violation)
+        if len(subnets) <= limit:
+            return False
+    else:
+        # No handover protection - just count IPs
+        if len(ips) <= limit:
+            return False
+    
     return await handle_violation(user_id, ips, limit)
 
 async def scan_all_users():
@@ -703,6 +743,13 @@ async def page_settings(req):
 <div></div>
 </div></div>
 
+<div class="card"><h2>📱 Handover Protection</h2>
+<p style="color:var(--muted);margin-bottom:16px;font-size:13px">Prevents false bans when user's IP changes due to mobile network handover (same /24 subnet)</p>
+<div class="form-row">
+<div><label>Enable Handover Protection</label><select name="HANDOVER_PROTECTION"><option value="true" {"selected" if cfg('HANDOVER_PROTECTION','true').lower()=='true' else ""}>Enabled</option><option value="false" {"selected" if cfg('HANDOVER_PROTECTION','true').lower()=='false' else ""}>Disabled</option></select><div class="form-hint">Count subnets instead of IPs</div></div>
+<div><label>Grace Subnets</label><input name="HANDOVER_GRACE" value="{cfg_int('HANDOVER_GRACE',1)}" type="number" min="0" max="5"><div class="form-hint">Extra subnets allowed (0 = strict, 1 = recommended)</div></div>
+</div></div>
+
 <div class="card"><h2>🔐 Password</h2>
 <label>New Password</label><input name="new_password" type="password" placeholder="Leave empty to keep current"></div>
 
@@ -745,6 +792,8 @@ async def action_save_settings(req):
         'SCAN_INTERVAL_SECONDS': data.get('SCAN_INTERVAL_SECONDS', '30'),
         'DISABLE_MINUTES': data.get('DISABLE_MINUTES', '10'),
         'DROP_ALL_IPS': data.get('DROP_ALL_IPS', 'true'),
+        'HANDOVER_PROTECTION': data.get('HANDOVER_PROTECTION', 'true'),
+        'HANDOVER_GRACE': data.get('HANDOVER_GRACE', '1'),
     })
     save_env(env)
     if data.get('new_password'):
