@@ -369,45 +369,95 @@ async def handle_violation(user_id, ips, limit):
     )
     return True
 
-def get_unique_subnets(ips):
-    """Get unique /24 subnets from IP list"""
-    subnets = set()
-    for ip in ips:
-        parts = ip.split('.')
-        if len(parts) == 4:
-            subnets.add('.'.join(parts[:3]))
-    return subnets
+def get_ip_subnet(ip):
+    """Get /24 subnet from IP"""
+    parts = ip.split('.')
+    return '.'.join(parts[:3]) if len(parts) == 4 else ip
+
+def analyze_sharing(user_id, limit):
+    """
+    Analyze if user is sharing. Returns (is_sharing, ips_to_drop, reason)
+    
+    Sharing indicators:
+    1. Multiple IPs from DIFFERENT subnets active simultaneously
+    2. Connections from multiple nodes at the same time
+    3. High frequency of IP changes (more than normal handover)
+    """
+    now = int(time.time())
+    window = cfg_int('IP_WINDOW_SECONDS', 300)
+    concurrent_window = cfg_int('CONCURRENT_WINDOW', 60)
+    
+    # Get all connections with timestamps
+    rows = db.conn.execute('''
+        SELECT ip, node, ts FROM connections 
+        WHERE user=? AND ts>? ORDER BY ts DESC
+    ''', (user_id, now - window)).fetchall()
+    
+    if not rows:
+        return False, [], "no data"
+    
+    # Group by IP
+    ip_data = {}
+    for ip, node, ts in rows:
+        if ip not in ip_data:
+            ip_data[ip] = {'nodes': set(), 'times': [], 'subnet': get_ip_subnet(ip)}
+        ip_data[ip]['nodes'].add(node)
+        ip_data[ip]['times'].append(ts)
+    
+    all_ips = list(ip_data.keys())
+    if len(all_ips) <= limit:
+        return False, [], "within limit"
+    
+    # Check 1: Concurrent IPs (active in last N seconds)
+    concurrent_ips = [ip for ip, data in ip_data.items() if max(data['times']) >= now - concurrent_window]
+    
+    # Check 2: Different subnets among concurrent IPs
+    concurrent_subnets = set(ip_data[ip]['subnet'] for ip in concurrent_ips)
+    
+    # Check 3: Multiple nodes at same time
+    recent_nodes = set()
+    for ip in concurrent_ips:
+        recent_nodes.update(ip_data[ip]['nodes'])
+    
+    # Decision logic
+    is_sharing = False
+    reason = ""
+    
+    if len(concurrent_ips) > limit:
+        if len(concurrent_subnets) > limit:
+            # Different subnets = definitely different locations/devices
+            is_sharing = True
+            reason = f"{len(concurrent_ips)} IPs from {len(concurrent_subnets)} subnets"
+        elif len(recent_nodes) > 1:
+            # Same subnet but different nodes = suspicious
+            is_sharing = True
+            reason = f"{len(concurrent_ips)} IPs on {len(recent_nodes)} nodes"
+        elif len(concurrent_ips) > limit + 1:
+            # Too many IPs even from same subnet
+            is_sharing = True
+            reason = f"{len(concurrent_ips)} concurrent IPs (limit {limit})"
+    
+    return is_sharing, concurrent_ips if is_sharing else [], reason
 
 async def check_user(user_id):
-    ips = db.get_user_ips(user_id)
-    if len(ips) <= 1:
-        return False
-    
     limit = await get_user_limit(user_id)
     if limit <= 0:
         return False
     
-    # Handover Protection
-    handover_enabled = cfg('HANDOVER_PROTECTION', 'true').lower() == 'true'
+    smart_enabled = cfg('SMART_DETECTION', 'true').lower() == 'true'
     
-    if handover_enabled:
-        # Count by subnets instead of IPs
-        subnets = get_unique_subnets(ips)
-        grace = cfg_int('HANDOVER_GRACE', 1)  # Allow +1 subnet for handover
-        
-        # If unique subnets <= limit + grace, it's likely handover
-        if len(subnets) <= limit + grace:
+    if smart_enabled:
+        is_sharing, ips, reason = analyze_sharing(user_id, limit)
+        if not is_sharing:
             return False
-        
-        # Check if subnets exceed limit (real violation)
-        if len(subnets) <= limit:
-            return False
+        log(f"Sharing detected for {user_id}: {reason}", 'WARNING')
+        return await handle_violation(user_id, ips, limit)
     else:
-        # No handover protection - just count IPs
-        if len(ips) <= limit:
+        # Simple mode - just count IPs
+        all_ips = db.get_user_ips(user_id)
+        if len(all_ips) <= limit:
             return False
-    
-    return await handle_violation(user_id, ips, limit)
+        return await handle_violation(user_id, all_ips, limit)
 
 async def scan_all_users():
     violations = 0
@@ -766,11 +816,11 @@ async def page_settings(req):
 <div></div>
 </div></div>
 
-<div class="card"><h2>📱 Handover Protection</h2>
-<p style="color:var(--muted);margin-bottom:16px;font-size:13px">Prevents false bans when user's IP changes due to mobile network handover (same /24 subnet)</p>
+<div class="card"><h2>📱 Smart Detection</h2>
+<p style="color:var(--muted);margin-bottom:16px;font-size:13px">Detects real violations by checking concurrent connections. Prevents false bans from handover (IP change).</p>
 <div class="form-row">
-<div><label>Enable Handover Protection</label><select name="HANDOVER_PROTECTION"><option value="true" {"selected" if cfg('HANDOVER_PROTECTION','true').lower()=='true' else ""}>Enabled</option><option value="false" {"selected" if cfg('HANDOVER_PROTECTION','true').lower()=='false' else ""}>Disabled</option></select><div class="form-hint">Count subnets instead of IPs</div></div>
-<div><label>Grace Subnets</label><input name="HANDOVER_GRACE" value="{cfg_int('HANDOVER_GRACE',1)}" type="number" min="0" max="5"><div class="form-hint">Extra subnets allowed (0 = strict, 1 = recommended)</div></div>
+<div><label>Enable Smart Detection</label><select name="SMART_DETECTION"><option value="true" {"selected" if cfg('SMART_DETECTION','true').lower()=='true' else ""}>Enabled</option><option value="false" {"selected" if cfg('SMART_DETECTION','true').lower()=='false' else ""}>Disabled</option></select><div class="form-hint">Only count IPs active at the same time</div></div>
+<div><label>Concurrent Window (sec)</label><input name="CONCURRENT_WINDOW" value="{cfg_int('CONCURRENT_WINDOW',60)}" type="number" min="10" max="300"><div class="form-hint">Time window to detect simultaneous connections</div></div>
 </div></div>
 
 <div class="card"><h2>🔐 Password</h2>
@@ -815,8 +865,8 @@ async def action_save_settings(req):
         'SCAN_INTERVAL_SECONDS': data.get('SCAN_INTERVAL_SECONDS', '30'),
         'DISABLE_MINUTES': data.get('DISABLE_MINUTES', '10'),
         'DROP_ALL_IPS': data.get('DROP_ALL_IPS', 'true'),
-        'HANDOVER_PROTECTION': data.get('HANDOVER_PROTECTION', 'true'),
-        'HANDOVER_GRACE': data.get('HANDOVER_GRACE', '1'),
+        'SMART_DETECTION': data.get('SMART_DETECTION', 'true'),
+        'CONCURRENT_WINDOW': data.get('CONCURRENT_WINDOW', '60'),
     })
     save_env(env)
     if data.get('new_password'):
