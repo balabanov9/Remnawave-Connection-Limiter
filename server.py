@@ -717,7 +717,7 @@ async def page_violators(req):
 <div class="card"><h2>🚨 Users with Multiple IPs</h2>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
 <p style="color:var(--muted);font-size:13px">Red = exceeds limit. Use manual Drop button to take action.</p>
-<a href="/export/violators.csv" class="btn btn-sm btn-ghost">📥 Export CSV</a>
+<div style="display:flex;gap:8px"><a href="/export/violators.html" class="btn btn-sm btn-primary">📊 Export Report</a><a href="/export/violators.csv" class="btn btn-sm btn-ghost">📥 CSV</a></div>
 </div>
 <table><tr><th>User</th><th>IPs</th><th>Limit</th><th>Status</th><th>Addresses</th><th>Action</th></tr>{rows}</table></div>
 <div class="card"><h2>🔍 Manual Check</h2><form method="POST" action="/action/check_user">
@@ -998,6 +998,73 @@ async def export_violators_csv(req):
         text=csv_content,
         content_type='text/csv',
         headers={'Content-Disposition': f'attachment; filename="violators_{ts}.csv"'}
+
+async def export_violators_html(req):
+    if not await check_auth(req):
+        return web.HTTPFound('/')
+    
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    rows = ''
+    total = 0
+    violations = 0
+    for user, cnt, ips in db.get_violators():
+        limit = await get_user_limit(user)
+        total += 1
+        is_violation = limit > 0 and cnt > limit
+        if is_violation:
+            violations += 1
+            status = '<span style="color:#ef4444;font-weight:bold">⚠️ VIOLATION</span>'
+            row_style = 'background:#fef2f2;'
+        elif limit > 0:
+            status = '<span style="color:#22c55e">✓ OK</span>'
+            row_style = ''
+        else:
+            status = '<span style="color:#f59e0b">No limit</span>'
+            row_style = ''
+        
+        ips_list = ips.split(',') if ips else []
+        ips_formatted = '<br>'.join(ips_list)
+        
+        rows += f'<tr style="{row_style}"><td>{user}</td><td>{cnt}</td><td>{limit if limit > 0 else "∞"}</td><td>{status}</td><td style="font-size:12px">{ips_formatted}</td></tr>'
+    
+    html = f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Violators Report - {ts}</title>
+<style>
+body {{ font-family: 'Segoe UI', Arial, sans-serif; padding: 40px; background: #f8fafc; }}
+h1 {{ color: #1e293b; margin-bottom: 8px; }}
+.meta {{ color: #64748b; margin-bottom: 24px; }}
+.stats {{ display: flex; gap: 24px; margin-bottom: 24px; }}
+.stat {{ background: white; padding: 16px 24px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+.stat-value {{ font-size: 28px; font-weight: bold; color: #8b5cf6; }}
+.stat-label {{ font-size: 12px; color: #64748b; text-transform: uppercase; }}
+table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+th {{ background: #8b5cf6; color: white; padding: 14px; text-align: left; font-weight: 600; }}
+td {{ padding: 12px 14px; border-bottom: 1px solid #e2e8f0; }}
+tr:hover {{ background: #f8fafc; }}
+</style>
+</head>
+<body>
+<h1>🔒 Connection Limiter Report</h1>
+<p class="meta">Generated: {ts}</p>
+<div class="stats">
+<div class="stat"><div class="stat-value">{total}</div><div class="stat-label">Total Users</div></div>
+<div class="stat"><div class="stat-value" style="color:#ef4444">{violations}</div><div class="stat-label">Violations</div></div>
+</div>
+<table>
+<tr><th>User ID</th><th>IPs</th><th>Limit</th><th>Status</th><th>IP Addresses</th></tr>
+{rows}
+</table>
+</body>
+</html>'''
+    
+    return web.Response(
+        text=html,
+        content_type='text/html',
+        headers={'Content-Disposition': f'attachment; filename="violators_{datetime.now().strftime("%Y%m%d_%H%M%S")}.html"'}
     )
 
 
@@ -1067,6 +1134,7 @@ async def main():
     app.router.add_post('/action/check_user', action_check_user)
     app.router.add_post('/action/unban_user', action_unban_user)
     app.router.add_get('/export/violators.csv', export_violators_csv)
+    app.router.add_get('/export/violators.html', export_violators_html)
     
     asyncio.create_task(scanner_task())
     asyncio.create_task(cleanup_task())
