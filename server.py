@@ -369,23 +369,34 @@ async def handle_violation(user_id, ips, limit):
     )
     return True
 
-def get_ip_subnet(ip):
-    """Get /24 subnet from IP"""
+def get_ip_subnet(ip, mask=16):
+    """Get subnet from IP. mask=8 for /8, mask=16 for /16, mask=24 for /24"""
     parts = ip.split('.')
-    return '.'.join(parts[:3]) if len(parts) == 4 else ip
+    if len(parts) != 4:
+        return ip
+    if mask == 8:
+        return parts[0]  # e.g. 176
+    if mask == 16:
+        return '.'.join(parts[:2])  # e.g. 176.15
+    return '.'.join(parts[:3])  # e.g. 176.15.198
 
 def analyze_sharing(user_id, limit):
     """
     Analyze if user is sharing. Returns (is_sharing, ips_to_drop, reason)
     
     Sharing indicators:
-    1. Multiple IPs from DIFFERENT subnets active simultaneously
+    1. Multiple IPs from DIFFERENT /16 networks (different ISPs) active simultaneously
     2. Connections from multiple nodes at the same time
-    3. High frequency of IP changes (more than normal handover)
+    3. Too many concurrent IPs even from same ISP
+    
+    Handover protection:
+    - IPs from same /16 network (e.g. 176.14.x.x and 176.15.x.x) = same ISP = likely handover
+    - Only flag as sharing if IPs are from truly different networks
     """
     now = int(time.time())
     window = cfg_int('IP_WINDOW_SECONDS', 300)
     concurrent_window = cfg_int('CONCURRENT_WINDOW', 60)
+    subnet_mask = cfg_int('SUBNET_MASK', 8)  # /8 by default for ISP-level detection
     
     # Get all connections with timestamps
     rows = db.conn.execute('''
@@ -400,7 +411,11 @@ def analyze_sharing(user_id, limit):
     ip_data = {}
     for ip, node, ts in rows:
         if ip not in ip_data:
-            ip_data[ip] = {'nodes': set(), 'times': [], 'subnet': get_ip_subnet(ip)}
+            ip_data[ip] = {
+                'nodes': set(), 
+                'times': [], 
+                'isp': get_ip_subnet(ip, subnet_mask),  # ISP level based on setting
+            }
         ip_data[ip]['nodes'].add(node)
         ip_data[ip]['times'].append(ts)
     
@@ -411,31 +426,33 @@ def analyze_sharing(user_id, limit):
     # Check 1: Concurrent IPs (active in last N seconds)
     concurrent_ips = [ip for ip, data in ip_data.items() if max(data['times']) >= now - concurrent_window]
     
-    # Check 2: Different subnets among concurrent IPs
-    concurrent_subnets = set(ip_data[ip]['subnet'] for ip in concurrent_ips)
+    if len(concurrent_ips) <= limit:
+        return False, [], "concurrent within limit"
+    
+    # Check 2: Different ISPs (based on subnet mask) among concurrent IPs
+    concurrent_isps = set(ip_data[ip]['isp'] for ip in concurrent_ips)
     
     # Check 3: Multiple nodes at same time
     recent_nodes = set()
     for ip in concurrent_ips:
         recent_nodes.update(ip_data[ip]['nodes'])
     
-    # Decision logic
+    # Decision logic - more strict now
     is_sharing = False
     reason = ""
     
-    if len(concurrent_ips) > limit:
-        if len(concurrent_subnets) > limit:
-            # Different subnets = definitely different locations/devices
-            is_sharing = True
-            reason = f"{len(concurrent_ips)} IPs from {len(concurrent_subnets)} subnets"
-        elif len(recent_nodes) > 1:
-            # Same subnet but different nodes = suspicious
-            is_sharing = True
-            reason = f"{len(concurrent_ips)} IPs on {len(recent_nodes)} nodes"
-        elif len(concurrent_ips) > limit + 1:
-            # Too many IPs even from same subnet
-            is_sharing = True
-            reason = f"{len(concurrent_ips)} concurrent IPs (limit {limit})"
+    # Primary check: Different ISPs = definitely sharing
+    if len(concurrent_isps) > limit:
+        is_sharing = True
+        reason = f"{len(concurrent_ips)} IPs from {len(concurrent_isps)} ISPs ({', '.join(concurrent_isps)})"
+    # Secondary: Same ISP but different nodes simultaneously = suspicious
+    elif len(recent_nodes) > 1 and len(concurrent_ips) > limit:
+        is_sharing = True
+        reason = f"{len(concurrent_ips)} IPs on {len(recent_nodes)} different nodes"
+    # Tertiary: Way too many IPs even from same ISP (limit + 2 or more)
+    elif len(concurrent_ips) > limit + 2:
+        is_sharing = True
+        reason = f"{len(concurrent_ips)} concurrent IPs (limit {limit}, tolerance +2)"
     
     return is_sharing, concurrent_ips if is_sharing else [], reason
 
@@ -561,57 +578,66 @@ async def check_auth(req):
     return sid and sid in sessions
 
 CSS = '''
-:root{--bg:#0a0a0f;--bg2:#12121a;--card:#1a1a24;--accent:#6366f1;--success:#10b981;--warn:#f59e0b;--danger:#ef4444;--text:#f1f5f9;--muted:#64748b;--border:#2a2a3a}
+:root{--bg:linear-gradient(135deg,#0f0f1a 0%,#1a1a2e 50%,#16213e 100%);--bg2:#1a1a2e;--card:rgba(30,30,50,0.8);--accent:#8b5cf6;--accent2:#a78bfa;--success:#34d399;--warn:#fbbf24;--danger:#f87171;--text:#f8fafc;--muted:#94a3b8;--border:rgba(139,92,246,0.2)}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui;background:var(--bg);color:var(--text);min-height:100vh}
-.container{max-width:1200px;margin:0 auto;padding:24px}
-.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
-.logo{font-size:24px;font-weight:700;color:var(--accent)}
-.nav{display:flex;gap:8px;background:var(--bg2);padding:6px;border-radius:12px;flex-wrap:wrap}
-.nav a{padding:10px 16px;color:var(--muted);text-decoration:none;border-radius:8px;font-size:14px}
-.nav a:hover{background:var(--card);color:var(--text)}
-.nav a.active{background:var(--accent);color:#fff}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;margin-bottom:24px}
-.stat{background:var(--card);border-radius:16px;padding:20px;border:1px solid var(--border)}
-.stat-value{font-size:32px;font-weight:700;color:var(--accent)}
-.stat-label{font-size:12px;color:var(--muted);margin-top:4px}
-.card{background:var(--card);border-radius:16px;padding:24px;margin-bottom:20px;border:1px solid var(--border)}
-.card h2{font-size:16px;margin-bottom:16px;color:var(--text)}
-.badge{display:inline-block;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600}
-.badge-ok{background:rgba(16,185,129,.15);color:var(--success)}
-.badge-err{background:rgba(239,68,68,.15);color:var(--danger)}
-.badge-warn{background:rgba(245,158,11,.15);color:var(--warn)}
-table{width:100%;border-collapse:collapse}
-th,td{padding:12px;text-align:left;border-bottom:1px solid var(--border);font-size:14px}
-th{color:var(--muted)}
-tr:hover{background:var(--bg2)}
-.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-danger{background:var(--danger);color:#fff}
-.btn-sm{padding:6px 12px;font-size:12px}
-.btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border)}
-input,select{width:100%;padding:12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;margin-bottom:16px}
-input:focus{outline:none;border-color:var(--accent)}
-label{display:block;margin-bottom:6px;font-size:13px;color:var(--muted)}
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.form-hint{font-size:11px;color:var(--muted);margin-top:-12px;margin-bottom:16px}
-.logs{background:var(--bg2);border-radius:8px;padding:16px;max-height:400px;overflow-y:auto;font-family:monospace;font-size:12px}
-.log-entry{padding:6px 0;border-bottom:1px solid var(--border);display:flex;gap:12px}
-.log-time{color:var(--muted);min-width:60px}
-.log-INFO{color:var(--accent)}
-.log-WARNING{color:var(--warn)}
-.log-ERROR{color:var(--danger)}
-.event{padding:12px;border-radius:8px;margin-bottom:8px;background:var(--bg2)}
-.event.violation{background:rgba(239,68,68,.1);border-left:3px solid var(--danger)}
-.login-box{max-width:400px;margin:100px auto;background:var(--card);padding:40px;border-radius:20px;border:1px solid var(--border)}
-.login-box h1{text-align:center;margin-bottom:32px;color:var(--accent)}
-.alert{padding:12px 16px;border-radius:8px;margin-bottom:20px;font-size:14px}
-.alert-ok{background:rgba(16,185,129,.15);color:var(--success)}
-.alert-err{background:rgba(239,68,68,.15);color:var(--danger)}
-.ip-list{font-size:11px;color:var(--muted);max-width:200px;word-break:break-all}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:8px}
-.dot-on{background:var(--success)}
-.dot-off{background:var(--danger)}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);background-attachment:fixed;color:var(--text);min-height:100vh}
+.container{max-width:1280px;margin:0 auto;padding:32px}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:32px;padding:20px 24px;background:var(--card);border-radius:20px;backdrop-filter:blur(10px);border:1px solid var(--border);box-shadow:0 8px 32px rgba(0,0,0,0.3)}
+.logo{font-size:28px;font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;display:flex;align-items:center;gap:12px}
+.nav{display:flex;gap:6px;background:var(--card);padding:8px;border-radius:16px;backdrop-filter:blur(10px);border:1px solid var(--border);flex-wrap:wrap}
+.nav a{padding:12px 20px;color:var(--muted);text-decoration:none;border-radius:12px;font-size:14px;font-weight:500;transition:all 0.3s}
+.nav a:hover{background:rgba(139,92,246,0.1);color:var(--text);transform:translateY(-2px)}
+.nav a.active{background:linear-gradient(135deg,var(--accent),#7c3aed);color:#fff;box-shadow:0 4px 15px rgba(139,92,246,0.4)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:20px;margin-bottom:32px}
+.stat{background:var(--card);border-radius:20px;padding:24px;border:1px solid var(--border);backdrop-filter:blur(10px);transition:transform 0.3s,box-shadow 0.3s}
+.stat:hover{transform:translateY(-4px);box-shadow:0 12px 40px rgba(139,92,246,0.2)}
+.stat-value{font-size:36px;font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.stat-label{font-size:13px;color:var(--muted);margin-top:8px;text-transform:uppercase;letter-spacing:0.5px}
+.card{background:var(--card);border-radius:20px;padding:28px;margin-bottom:24px;border:1px solid var(--border);backdrop-filter:blur(10px)}
+.card h2{font-size:18px;margin-bottom:20px;color:var(--text);display:flex;align-items:center;gap:10px}
+.badge{display:inline-flex;align-items:center;padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600;gap:6px}
+.badge-ok{background:rgba(52,211,153,0.15);color:var(--success);border:1px solid rgba(52,211,153,0.3)}
+.badge-err{background:rgba(248,113,113,0.15);color:var(--danger);border:1px solid rgba(248,113,113,0.3)}
+.badge-warn{background:rgba(251,191,36,0.15);color:var(--warn);border:1px solid rgba(251,191,36,0.3)}
+table{width:100%;border-collapse:separate;border-spacing:0}
+th,td{padding:16px;text-align:left;font-size:14px}
+th{color:var(--muted);font-weight:500;text-transform:uppercase;font-size:12px;letter-spacing:0.5px;border-bottom:1px solid var(--border)}
+td{border-bottom:1px solid rgba(139,92,246,0.1)}
+tr{transition:background 0.2s}
+tr:hover{background:rgba(139,92,246,0.05)}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border:none;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;transition:all 0.3s}
+.btn-primary{background:linear-gradient(135deg,var(--accent),#7c3aed);color:#fff;box-shadow:0 4px 15px rgba(139,92,246,0.3)}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(139,92,246,0.4)}
+.btn-danger{background:linear-gradient(135deg,var(--danger),#dc2626);color:#fff}
+.btn-success{background:linear-gradient(135deg,var(--success),#10b981);color:#fff}
+.btn-sm{padding:8px 16px;font-size:12px;border-radius:8px}
+.btn-ghost{background:rgba(139,92,246,0.1);color:var(--accent);border:1px solid var(--border)}
+.btn-ghost:hover{background:rgba(139,92,246,0.2)}
+input,select{width:100%;padding:14px 18px;background:rgba(15,15,26,0.6);border:1px solid var(--border);border-radius:12px;color:var(--text);font-size:14px;margin-bottom:16px;transition:all 0.3s}
+input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(139,92,246,0.2)}
+label{display:block;margin-bottom:8px;font-size:13px;color:var(--muted);font-weight:500}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.form-hint{font-size:11px;color:var(--muted);margin-top:-12px;margin-bottom:16px;opacity:0.8}
+.logs{background:rgba(15,15,26,0.6);border-radius:12px;padding:20px;max-height:400px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:12px;border:1px solid var(--border)}
+.log-entry{padding:8px 0;border-bottom:1px solid rgba(139,92,246,0.1);display:flex;gap:16px;align-items:center}
+.log-time{color:var(--muted);min-width:70px;font-size:11px}
+.log-INFO{color:var(--accent);font-weight:600}
+.log-WARNING{color:var(--warn);font-weight:600}
+.log-ERROR{color:var(--danger);font-weight:600}
+.event{padding:16px;border-radius:12px;margin-bottom:10px;background:rgba(15,15,26,0.4);border:1px solid var(--border);transition:all 0.2s}
+.event:hover{background:rgba(139,92,246,0.05)}
+.event.violation{background:rgba(248,113,113,0.1);border-left:4px solid var(--danger)}
+.login-box{max-width:420px;margin:80px auto;background:var(--card);padding:48px;border-radius:24px;border:1px solid var(--border);backdrop-filter:blur(10px);box-shadow:0 20px 60px rgba(0,0,0,0.4)}
+.login-box h1{text-align:center;margin-bottom:40px;font-size:32px;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.alert{padding:16px 20px;border-radius:12px;margin-bottom:24px;font-size:14px;display:flex;align-items:center;gap:10px}
+.alert-ok{background:rgba(52,211,153,0.15);color:var(--success);border:1px solid rgba(52,211,153,0.3)}
+.alert-err{background:rgba(248,113,113,0.15);color:var(--danger);border:1px solid rgba(248,113,113,0.3)}
+.ip-list{font-size:11px;color:var(--muted);max-width:220px;word-break:break-all}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:10px;box-shadow:0 0 8px currentColor}
+.dot-on{background:var(--success);color:var(--success)}
+.dot-off{background:var(--danger);color:var(--danger)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+.pulse{animation:pulse 2s infinite}
 '''
 
 
@@ -713,10 +739,13 @@ async def page_violators(req):
     if not rows:
         rows = '<tr><td colspan="6" style="color:var(--muted)">No users with multiple IPs</td></tr>'
     
-    content = f'''{alert}<div class="card"><h2>Users with Multiple IPs</h2>
-<p style="color:var(--muted);margin-bottom:16px;font-size:13px">Red = exceeds limit</p>
+    content = f'''{alert}<div class="card"><h2>🚨 Users with Multiple IPs</h2>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+<p style="color:var(--muted);font-size:13px">Red = exceeds limit. Smart detection analyzes concurrent connections.</p>
+<a href="/export/violators.csv" class="btn btn-sm btn-ghost">📥 Export CSV</a>
+</div>
 <table><tr><th>User</th><th>IPs</th><th>Limit</th><th>Status</th><th>Addresses</th><th>Action</th></tr>{rows}</table></div>
-<div class="card"><h2>Manual Check</h2><form method="POST" action="/action/check_user">
+<div class="card"><h2>🔍 Manual Check</h2><form method="POST" action="/action/check_user">
 <div class="form-row"><div><label>User ID</label><input name="user_id" placeholder="934057566"></div>
 <div style="display:flex;align-items:flex-end"><button class="btn btn-primary">Check</button></div></div></form></div>'''
     return web.Response(text=base_html(content, 'violators'), content_type='text/html')
@@ -821,6 +850,10 @@ async def page_settings(req):
 <div class="form-row">
 <div><label>Enable Smart Detection</label><select name="SMART_DETECTION"><option value="true" {"selected" if cfg('SMART_DETECTION','true').lower()=='true' else ""}>Enabled</option><option value="false" {"selected" if cfg('SMART_DETECTION','true').lower()=='false' else ""}>Disabled</option></select><div class="form-hint">Only count IPs active at the same time</div></div>
 <div><label>Concurrent Window (sec)</label><input name="CONCURRENT_WINDOW" value="{cfg_int('CONCURRENT_WINDOW',60)}" type="number" min="10" max="300"><div class="form-hint">Time window to detect simultaneous connections</div></div>
+</div>
+<div class="form-row">
+<div><label>Subnet Mask</label><select name="SUBNET_MASK"><option value="8" {"selected" if cfg_int('SUBNET_MASK',8)==8 else ""}>/8 (176.x.x.x = same) - recommended</option><option value="16" {"selected" if cfg_int('SUBNET_MASK',8)==16 else ""}>/16 (176.14.x.x ≠ 176.15.x.x)</option><option value="24" {"selected" if cfg_int('SUBNET_MASK',8)==24 else ""}>/24 (very strict)</option></select><div class="form-hint">/8 = 176.14.x.x and 176.15.x.x = same ISP (handover OK)</div></div>
+<div></div>
 </div></div>
 
 <div class="card"><h2>🔐 Password</h2>
@@ -867,6 +900,7 @@ async def action_save_settings(req):
         'DROP_ALL_IPS': data.get('DROP_ALL_IPS', 'true'),
         'SMART_DETECTION': data.get('SMART_DETECTION', 'true'),
         'CONCURRENT_WINDOW': data.get('CONCURRENT_WINDOW', '60'),
+        'SUBNET_MASK': data.get('SUBNET_MASK', '8'),
     })
     save_env(env)
     if data.get('new_password'):
@@ -953,6 +987,36 @@ async def action_check_user(req):
         return web.HTTPFound(f'/violators?msg={msg}')
     return web.HTTPFound('/violators')
 
+async def export_violators_csv(req):
+    if not await check_auth(req):
+        return web.HTTPFound('/')
+    
+    import csv
+    import io
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['user_id', 'ip_count', 'limit', 'status', 'ips'])
+    
+    for user, cnt, ips in db.get_violators():
+        limit = await get_user_limit(user)
+        if limit > 0 and cnt > limit:
+            status = 'VIOLATION'
+        elif limit > 0:
+            status = 'OK'
+        else:
+            status = 'NO_LIMIT'
+        writer.writerow([user, cnt, limit if limit > 0 else 'unlimited', status, ips])
+    
+    csv_content = output.getvalue()
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    return web.Response(
+        text=csv_content,
+        content_type='text/csv',
+        headers={'Content-Disposition': f'attachment; filename="violators_{ts}.csv"'}
+    )
+
 
 # ============ BACKGROUND TASKS ============
 async def scanner_task():
@@ -1018,6 +1082,7 @@ async def main():
     app.router.add_post('/action/clear_logs', action_clear_logs)
     app.router.add_post('/action/drop_user', action_drop_user)
     app.router.add_post('/action/check_user', action_check_user)
+    app.router.add_get('/export/violators.csv', export_violators_csv)
     
     asyncio.create_task(scanner_task())
     asyncio.create_task(cleanup_task())
