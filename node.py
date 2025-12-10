@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Connection Limiter - Node Reporter (Enhanced)
-- Real-time log monitoring with batch sending
+Connection Limiter - Node Agent
+- Sends log file to central server periodically
 - Handles DROP commands via iptables
 """
 
 import os
-import re
 import time
 import json
 import subprocess
 import threading
 from pathlib import Path
-from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 
@@ -33,137 +31,98 @@ NODE_NAME = os.getenv('NODE_NAME', 'node-1')
 LOG_PATH = os.getenv('LOG_PATH', '/var/log/remnanode/access.log')
 API_PORT = int(os.getenv('API_PORT', '5001'))
 API_SECRET = os.getenv('API_SECRET', 'secret')
-BATCH_SIZE = int(os.getenv('BATCH_SIZE', '50'))
-BATCH_INTERVAL = float(os.getenv('BATCH_INTERVAL', '1.0'))
+SEND_INTERVAL = int(os.getenv('SEND_INTERVAL', '5'))  # seconds
+MAX_LINES = int(os.getenv('MAX_LINES', '1000'))  # max lines to send
 
 # ============ STATE ============
 
 blocked_ips = {}  # ip -> expire_time
 blocked_lock = threading.Lock()
-pending_entries = deque()
-pending_lock = threading.Lock()
 session = requests.Session()
-stats = {'sent': 0, 'parsed': 0, 'errors': 0}
+stats = {'sent': 0, 'errors': 0, 'last_send': 0}
+last_position = 0  # Track file position
 
-# ============ LOG PARSING ============
+# ============ LOG SENDING ============
 
-# Multiple patterns for different Xray log formats
-PATTERNS = [
-    # Standard: from tcp:1.2.3.4:12345 ... email: user_123
-    (re.compile(r'from (?:tcp:)?(\d+\.\d+\.\d+\.\d+):\d+'), re.compile(r'email:\s*(\S+)')),
-    # Alternative: [user_123] 1.2.3.4:12345
-    (re.compile(r'\[([^\]]+)\].*?(\d+\.\d+\.\d+\.\d+)'), None),
-]
-
-def parse_line(line: str):
-    """Parse Xray log line -> (user, ip) or (None, None)"""
-    # Try standard pattern first
-    ip_match = re.search(r'from (?:tcp:)?(\d+\.\d+\.\d+\.\d+):\d+', line)
-    email_match = re.search(r'email:\s*(\S+)', line)
+def read_new_lines():
+    """Read new lines from log file"""
+    global last_position
     
-    if ip_match and email_match:
-        return email_match.group(1), ip_match.group(1)
-    
-    # Try to find any IP and user pattern
-    ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
-    user_match = re.search(r'(user_\d+)', line)
-    
-    if ip_match and user_match:
-        return user_match.group(1), ip_match.group(1)
-    
-    return None, None
-
-def send_batch(entries):
-    """Send batch of entries to server"""
-    if not entries:
-        return
+    if not os.path.exists(LOG_PATH):
+        return []
     
     try:
-        url = SERVER_URL.rstrip('/') + '/log_batch'
+        with open(LOG_PATH, 'r') as f:
+            # Check if file was rotated (smaller than last position)
+            f.seek(0, 2)  # End of file
+            current_size = f.tell()
+            
+            if current_size < last_position:
+                # File was rotated, start from beginning
+                print(f"[*] Log rotated, reading from start")
+                last_position = 0
+            
+            # Read from last position
+            f.seek(last_position)
+            lines = f.readlines()
+            last_position = f.tell()
+            
+            # Limit lines
+            if len(lines) > MAX_LINES:
+                lines = lines[-MAX_LINES:]
+            
+            return [l.strip() for l in lines if l.strip()]
+    except Exception as e:
+        print(f"[!] Read error: {e}")
+        return []
+
+def send_logs():
+    """Send log lines to server"""
+    lines = read_new_lines()
+    
+    if not lines:
+        return 0
+    
+    try:
+        url = SERVER_URL.rstrip('/') + '/log_upload'
         resp = session.post(url, json={
             'node': NODE_NAME,
-            'entries': list(entries)
-        }, timeout=5)
+            'lines': lines,
+            'secret': API_SECRET
+        }, timeout=10)
         
         if resp.status_code == 200:
-            stats['sent'] += len(entries)
+            data = resp.json()
+            processed = data.get('processed', 0)
+            stats['sent'] += processed
+            stats['last_send'] = time.time()
+            if processed > 0:
+                print(f"[OK] Sent {len(lines)} lines, {processed} processed")
+            return processed
         else:
             stats['errors'] += 1
             print(f"[!] Server returned {resp.status_code}")
     except Exception as e:
         stats['errors'] += 1
         print(f"[!] Send error: {e}")
+    
+    return 0
 
-def batch_sender():
-    """Background thread that sends batches"""
-    while True:
-        time.sleep(BATCH_INTERVAL)
-        
-        with pending_lock:
-            if pending_entries:
-                batch = []
-                while pending_entries and len(batch) < BATCH_SIZE:
-                    batch.append(pending_entries.popleft())
-                
-                if batch:
-                    send_batch(batch)
-
-def tail_log():
-    """Tail log file and collect entries"""
-    print(f"[*] Watching {LOG_PATH}")
-    print(f"[*] Server: {SERVER_URL}")
-    print(f"[*] Node: {NODE_NAME}")
-    
-    while not os.path.exists(LOG_PATH):
-        print(f"[WAIT] Log file not found, waiting...")
-        time.sleep(5)
-    
-    print(f"[OK] Log file found")
-    
-    f = open(LOG_PATH, 'r')
-    f.seek(0, 2)  # End of file
-    inode = os.stat(LOG_PATH).st_ino
-    last_report = time.time()
+def sender_loop():
+    """Background thread that sends logs periodically"""
+    print(f"[*] Sender started, interval: {SEND_INTERVAL}s")
     
     while True:
-        line = f.readline()
-        if line:
-            user, ip = parse_line(line.strip())
-            if user and ip:
-                stats['parsed'] += 1
-                with pending_lock:
-                    pending_entries.append({'user': user, 'ip': ip})
-        else:
-            # Check for log rotation
-            try:
-                current_inode = os.stat(LOG_PATH).st_ino
-                if current_inode != inode:
-                    print("[*] Log rotated, reopening...")
-                    f.close()
-                    f = open(LOG_PATH, 'r')
-                    inode = current_inode
-            except FileNotFoundError:
-                print("[!] Log file disappeared, waiting...")
-                f.close()
-                while not os.path.exists(LOG_PATH):
-                    time.sleep(1)
-                f = open(LOG_PATH, 'r')
-                inode = os.stat(LOG_PATH).st_ino
-            
-            # Periodic stats
-            if time.time() - last_report > 60:
-                print(f"[STATS] Parsed: {stats['parsed']}, Sent: {stats['sent']}, Errors: {stats['errors']}")
-                last_report = time.time()
-            
-            time.sleep(0.05)
+        time.sleep(SEND_INTERVAL)
+        send_logs()
 
 # ============ IP BLOCKING ============
 
-def block_ip(ip: str, duration: int = 300):
+def block_ip(ip: str, duration: int = 600):
     """Block IP with iptables"""
     try:
         # Check if already blocked
-        r = subprocess.run(['iptables', '-C', 'INPUT', '-s', ip, '-j', 'DROP'], 
+        r = subprocess.run(['iptables', '-C', 'INPUT', '-s', ip, '-j', 'DROP'],
                           capture_output=True)
         if r.returncode != 0:
             subprocess.run(['iptables', '-I', 'INPUT', '-s', ip, '-j', 'DROP'], check=True)
@@ -219,7 +178,7 @@ class Handler(BaseHTTPRequestHandler):
             
             if self.path == '/block':
                 ip = data.get('ip')
-                duration = data.get('duration', 300)
+                duration = data.get('duration', 600)
                 ok = block_ip(ip, duration) if ip else False
                 self.send_response(200 if ok else 400)
             
@@ -232,7 +191,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
             
             elif self.path == '/clear':
-                # Clear all iptables rules we added
                 with blocked_lock:
                     for ip in list(blocked_ips.keys()):
                         unblock_ip(ip)
@@ -266,7 +224,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({
                 "node": NODE_NAME,
                 "blocked_ips": list(blocked_ips.keys()),
-                "stats": stats
+                "stats": stats,
+                "log_path": LOG_PATH,
+                "log_exists": os.path.exists(LOG_PATH)
             }).encode())
         else:
             self.send_response(404)
@@ -281,13 +241,19 @@ def run_api():
 
 def main():
     print("=" * 50)
-    print(f"  Node Reporter: {NODE_NAME}")
+    print(f"  Node Agent: {NODE_NAME}")
     print("=" * 50)
     print(f"Server: {SERVER_URL}")
     print(f"Log: {LOG_PATH}")
     print(f"API Port: {API_PORT}")
-    print(f"Batch: {BATCH_SIZE} entries / {BATCH_INTERVAL}s")
+    print(f"Send Interval: {SEND_INTERVAL}s")
     print()
+    
+    # Check log file
+    if os.path.exists(LOG_PATH):
+        print(f"[OK] Log file found")
+    else:
+        print(f"[!] Log file not found, will wait...")
     
     # Start API server
     threading.Thread(target=run_api, daemon=True).start()
@@ -295,11 +261,14 @@ def main():
     # Start cleanup loop
     threading.Thread(target=cleanup_loop, daemon=True).start()
     
-    # Start batch sender
-    threading.Thread(target=batch_sender, daemon=True).start()
+    # Start sender loop
+    threading.Thread(target=sender_loop, daemon=True).start()
     
-    # Tail log (main thread)
-    tail_log()
+    # Keep main thread alive
+    print("[*] Node agent running...")
+    while True:
+        time.sleep(60)
+        print(f"[STATS] Sent: {stats['sent']}, Errors: {stats['errors']}, Blocked: {len(blocked_ips)}")
 
 if __name__ == '__main__':
     main()
