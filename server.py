@@ -371,9 +371,12 @@ async def handle_violation(user_id, ips, limit, reason="IP_COUNT"):
 
 def analyze_sharing(user_id, limit):
     """
-    Multi-node sharing detection.
+    Sharing detection based on SIMULTANEOUS connections from different nodes.
     
-    Rule: If user connects from 2+ different NODES AND has more IPs than limit = SHARING
+    SHARING = user connected to 2+ VPN nodes AT THE SAME TIME
+    One person physically cannot be in two places at once.
+    
+    Handover (IP change on same node) is NOT flagged.
     """
     now = int(time.time())
     window = cfg_int('CONCURRENT_WINDOW', 30)
@@ -390,9 +393,10 @@ def analyze_sharing(user_id, limit):
     ips = [r[0] for r in rows]
     nodes = set(r[1] for r in rows if r[1])
     
-    # Only flag if IPs exceed limit AND multiple nodes
-    if len(ips) > limit and len(nodes) >= 2:
-        return True, ips, f"MULTI-NODE: {len(ips)} IPs on {len(nodes)} nodes ({', '.join(nodes)})"
+    # ONLY ban if connected to MULTIPLE NODES simultaneously
+    # This is the ONLY reliable way to detect sharing
+    if len(nodes) >= 2:
+        return True, ips, f"{len(ips)} IPs on {len(nodes)} nodes: {', '.join(nodes)}"
     
     return False, [], "ok"
 
@@ -401,19 +405,11 @@ async def check_user(user_id):
     if limit <= 0:
         return False
     
-    # Method 1: Simple IP count (always active)
+    # Simple IP count - ban if more IPs than limit
     all_ips = db.get_user_ips(user_id)
     if len(all_ips) > limit:
-        log(f"IP limit exceeded for {user_id}: {len(all_ips)} > {limit}", 'WARNING')
-        return await handle_violation(user_id, all_ips, limit, "IP_COUNT")
-    
-    # Method 2: Multi-node detection (if enabled)
-    if cfg('SMART_DETECTION', 'true').lower() == 'true':
-        is_sharing, ips, reason = analyze_sharing(user_id, limit)
-        if is_sharing:
-            log(f"Multi-node sharing for {user_id}: {reason}", 'WARNING')
-            return await handle_violation(user_id, ips, limit, reason)
-    
+        reason = f"{len(all_ips)} IPs > limit {limit}"
+        return await handle_violation(user_id, all_ips, limit, reason)
     return False
 
 async def scan_all_users():
@@ -699,7 +695,7 @@ async def page_violators(req):
 
 <div class="card"><h2>🚨 Users with Multiple IPs</h2>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
-<p style="color:var(--muted);font-size:13px">Red = exceeds limit. Multi-node detection catches users on 2+ servers.</p>
+<p style="color:var(--muted);font-size:13px">Red = exceeds limit. Use manual Drop button to take action.</p>
 <a href="/export/violators.csv" class="btn btn-sm btn-ghost">📥 Export CSV</a>
 </div>
 <table><tr><th>User</th><th>IPs</th><th>Limit</th><th>Status</th><th>Addresses</th><th>Action</th></tr>{rows}</table></div>
@@ -801,13 +797,6 @@ async def page_settings(req):
 <div class="form-row">
 <div><label>Drop All IPs</label><select name="DROP_ALL_IPS"><option value="true" {"selected" if cfg('DROP_ALL_IPS','true').lower()=='true' else ""}>Yes - drop ALL IPs</option><option value="false" {"selected" if cfg('DROP_ALL_IPS','true').lower()=='false' else ""}>No - only excess IPs</option></select><div class="form-hint">Drop all IPs or only those exceeding limit</div></div>
 <div></div>
-</div></div>
-
-<div class="card"><h2>🎯 Multi-Node Detection</h2>
-<p style="color:var(--muted);margin-bottom:16px;font-size:13px">Detects sharing by checking if user connects from multiple VPN nodes simultaneously. One person can't be in two places at once.</p>
-<div class="form-row">
-<div><label>Multi-Node Detection</label><select name="SMART_DETECTION"><option value="true" {"selected" if cfg('SMART_DETECTION','true').lower()=='true' else ""}>Enabled (recommended)</option><option value="false" {"selected" if cfg('SMART_DETECTION','true').lower()=='false' else ""}>Disabled</option></select><div class="form-hint">Ban if user on 2+ nodes at same time</div></div>
-<div><label>Detection Window (sec)</label><input name="CONCURRENT_WINDOW" value="{cfg_int('CONCURRENT_WINDOW',30)}" type="number" min="10" max="120"><div class="form-hint">Time window to check (30 sec recommended)</div></div>
 </div></div>
 
 <div class="card"><h2>🔐 Password</h2>
