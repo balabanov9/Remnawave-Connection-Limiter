@@ -166,8 +166,23 @@ class DB:
 db = DB()
 limit_cache = {}
 drop_cooldown = {}
-disabled_users = {}
 http = None
+
+# Persistent disabled users storage
+DISABLED_FILE = Path(__file__).parent / '.disabled_users.json'
+
+def load_disabled_users():
+    if DISABLED_FILE.exists():
+        try:
+            return json.loads(DISABLED_FILE.read_text())
+        except:
+            pass
+    return {}
+
+def save_disabled_users():
+    DISABLED_FILE.write_text(json.dumps(disabled_users))
+
+disabled_users = load_disabled_users()
 
 async def get_http():
     global http
@@ -240,6 +255,7 @@ async def disable_user_subscription(user_id, minutes=10):
         async with s.post(url, headers={"Authorization": f"Bearer {api_token}"}) as r:
             if r.status == 200:
                 disabled_users[user_id] = time.time() + (minutes * 60)
+                save_disabled_users()
                 log(f"Disabled user {user_id} (UUID: {uuid[:8]}...) for {minutes} min")
                 return True
             else:
@@ -264,6 +280,7 @@ async def enable_user_subscription(user_id):
         async with s.post(url, headers={"Authorization": f"Bearer {api_token}"}) as r:
             if r.status == 200:
                 disabled_users.pop(user_id, None)
+                save_disabled_users()
                 log(f"Re-enabled user {user_id}")
                 return True
     except:
