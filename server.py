@@ -998,6 +998,7 @@ async def export_violators_csv(req):
         text=csv_content,
         content_type='text/csv',
         headers={'Content-Disposition': f'attachment; filename="violators_{ts}.csv"'}
+    )
 
 async def export_violators_html(req):
     if not await check_auth(req):
