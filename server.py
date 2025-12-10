@@ -369,112 +369,57 @@ async def handle_violation(user_id, ips, limit):
     )
     return True
 
-def get_ip_subnet(ip, mask=16):
-    """Get subnet from IP. mask=8 for /8, mask=16 for /16, mask=24 for /24"""
-    parts = ip.split('.')
-    if len(parts) != 4:
-        return ip
-    if mask == 8:
-        return parts[0]  # e.g. 176
-    if mask == 16:
-        return '.'.join(parts[:2])  # e.g. 176.15
-    return '.'.join(parts[:3])  # e.g. 176.15.198
-
 def analyze_sharing(user_id, limit):
     """
-    Analyze if user is sharing. Returns (is_sharing, ips_to_drop, reason)
+    EFFECTIVE sharing detection.
     
-    Sharing indicators:
-    1. Multiple IPs from DIFFERENT /16 networks (different ISPs) active simultaneously
-    2. Connections from multiple nodes at the same time
-    3. Too many concurrent IPs even from same ISP
-    
-    Handover protection:
-    - IPs from same /16 network (e.g. 176.14.x.x and 176.15.x.x) = same ISP = likely handover
-    - Only flag as sharing if IPs are from truly different networks
+    Rule: If user connects from 2+ different NODES within short time = SHARING
+    One person CANNOT be on two VPN servers at the same time.
     """
     now = int(time.time())
-    window = cfg_int('IP_WINDOW_SECONDS', 300)
-    concurrent_window = cfg_int('CONCURRENT_WINDOW', 60)
-    subnet_mask = cfg_int('SUBNET_MASK', 8)  # /8 by default for ISP-level detection
+    window = cfg_int('CONCURRENT_WINDOW', 30)
     
-    # Get all connections with timestamps
+    # Get connections from last N seconds
     rows = db.conn.execute('''
-        SELECT ip, node, ts FROM connections 
-        WHERE user=? AND ts>? ORDER BY ts DESC
+        SELECT DISTINCT ip, node FROM connections 
+        WHERE user=? AND ts>?
     ''', (user_id, now - window)).fetchall()
     
     if not rows:
         return False, [], "no data"
     
-    # Group by IP
-    ip_data = {}
-    for ip, node, ts in rows:
-        if ip not in ip_data:
-            ip_data[ip] = {
-                'nodes': set(), 
-                'times': [], 
-                'isp': get_ip_subnet(ip, subnet_mask),  # ISP level based on setting
-            }
-        ip_data[ip]['nodes'].add(node)
-        ip_data[ip]['times'].append(ts)
+    ips = [r[0] for r in rows]
+    nodes = set(r[1] for r in rows if r[1])
     
-    all_ips = list(ip_data.keys())
-    if len(all_ips) <= limit:
-        return False, [], "within limit"
+    # MAIN CHECK: Multiple nodes = 100% SHARING
+    if len(nodes) >= 2:
+        return True, ips, f"SHARING: {len(nodes)} nodes ({', '.join(nodes)})"
     
-    # Check 1: Concurrent IPs (active in last N seconds)
-    concurrent_ips = [ip for ip, data in ip_data.items() if max(data['times']) >= now - concurrent_window]
+    # Secondary: Way too many IPs on single node
+    if len(ips) > limit + 2:
+        return True, ips, f"SHARING: {len(ips)} IPs (limit {limit})"
     
-    if len(concurrent_ips) <= limit:
-        return False, [], "concurrent within limit"
-    
-    # Check 2: Different ISPs (based on subnet mask) among concurrent IPs
-    concurrent_isps = set(ip_data[ip]['isp'] for ip in concurrent_ips)
-    
-    # Check 3: Multiple nodes at same time
-    recent_nodes = set()
-    for ip in concurrent_ips:
-        recent_nodes.update(ip_data[ip]['nodes'])
-    
-    # Decision logic - more strict now
-    is_sharing = False
-    reason = ""
-    
-    # Primary check: Different ISPs = definitely sharing
-    if len(concurrent_isps) > limit:
-        is_sharing = True
-        reason = f"{len(concurrent_ips)} IPs from {len(concurrent_isps)} ISPs ({', '.join(concurrent_isps)})"
-    # Secondary: Same ISP but different nodes simultaneously = suspicious
-    elif len(recent_nodes) > 1 and len(concurrent_ips) > limit:
-        is_sharing = True
-        reason = f"{len(concurrent_ips)} IPs on {len(recent_nodes)} different nodes"
-    # Tertiary: Way too many IPs even from same ISP (limit + 2 or more)
-    elif len(concurrent_ips) > limit + 2:
-        is_sharing = True
-        reason = f"{len(concurrent_ips)} concurrent IPs (limit {limit}, tolerance +2)"
-    
-    return is_sharing, concurrent_ips if is_sharing else [], reason
+    return False, [], "ok"
 
 async def check_user(user_id):
     limit = await get_user_limit(user_id)
     if limit <= 0:
         return False
     
-    smart_enabled = cfg('SMART_DETECTION', 'true').lower() == 'true'
-    
-    if smart_enabled:
-        is_sharing, ips, reason = analyze_sharing(user_id, limit)
-        if not is_sharing:
-            return False
-        log(f"Sharing detected for {user_id}: {reason}", 'WARNING')
-        return await handle_violation(user_id, ips, limit)
-    else:
-        # Simple mode - just count IPs
-        all_ips = db.get_user_ips(user_id)
-        if len(all_ips) <= limit:
-            return False
+    # Method 1: Simple IP count (always active)
+    all_ips = db.get_user_ips(user_id)
+    if len(all_ips) > limit:
+        log(f"IP limit exceeded for {user_id}: {len(all_ips)} > {limit}", 'WARNING')
         return await handle_violation(user_id, all_ips, limit)
+    
+    # Method 2: Multi-node detection (if enabled)
+    if cfg('SMART_DETECTION', 'true').lower() == 'true':
+        is_sharing, ips, reason = analyze_sharing(user_id, limit)
+        if is_sharing:
+            log(f"Multi-node sharing for {user_id}: {reason}", 'WARNING')
+            return await handle_violation(user_id, ips, limit)
+    
+    return False
 
 async def scan_all_users():
     violations = 0
@@ -741,7 +686,7 @@ async def page_violators(req):
     
     content = f'''{alert}<div class="card"><h2>🚨 Users with Multiple IPs</h2>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
-<p style="color:var(--muted);font-size:13px">Red = exceeds limit. Smart detection analyzes concurrent connections.</p>
+<p style="color:var(--muted);font-size:13px">Red = exceeds limit. Multi-node detection catches users on 2+ servers.</p>
 <a href="/export/violators.csv" class="btn btn-sm btn-ghost">📥 Export CSV</a>
 </div>
 <table><tr><th>User</th><th>IPs</th><th>Limit</th><th>Status</th><th>Addresses</th><th>Action</th></tr>{rows}</table></div>
@@ -845,15 +790,11 @@ async def page_settings(req):
 <div></div>
 </div></div>
 
-<div class="card"><h2>📱 Smart Detection</h2>
-<p style="color:var(--muted);margin-bottom:16px;font-size:13px">Detects real violations by checking concurrent connections. Prevents false bans from handover (IP change).</p>
+<div class="card"><h2>🎯 Multi-Node Detection</h2>
+<p style="color:var(--muted);margin-bottom:16px;font-size:13px">Detects sharing by checking if user connects from multiple VPN nodes simultaneously. One person can't be in two places at once.</p>
 <div class="form-row">
-<div><label>Enable Smart Detection</label><select name="SMART_DETECTION"><option value="true" {"selected" if cfg('SMART_DETECTION','true').lower()=='true' else ""}>Enabled</option><option value="false" {"selected" if cfg('SMART_DETECTION','true').lower()=='false' else ""}>Disabled</option></select><div class="form-hint">Only count IPs active at the same time</div></div>
-<div><label>Concurrent Window (sec)</label><input name="CONCURRENT_WINDOW" value="{cfg_int('CONCURRENT_WINDOW',60)}" type="number" min="10" max="300"><div class="form-hint">Time window to detect simultaneous connections</div></div>
-</div>
-<div class="form-row">
-<div><label>Subnet Mask</label><select name="SUBNET_MASK"><option value="8" {"selected" if cfg_int('SUBNET_MASK',8)==8 else ""}>/8 (176.x.x.x = same) - recommended</option><option value="16" {"selected" if cfg_int('SUBNET_MASK',8)==16 else ""}>/16 (176.14.x.x ≠ 176.15.x.x)</option><option value="24" {"selected" if cfg_int('SUBNET_MASK',8)==24 else ""}>/24 (very strict)</option></select><div class="form-hint">/8 = 176.14.x.x and 176.15.x.x = same ISP (handover OK)</div></div>
-<div></div>
+<div><label>Multi-Node Detection</label><select name="SMART_DETECTION"><option value="true" {"selected" if cfg('SMART_DETECTION','true').lower()=='true' else ""}>Enabled (recommended)</option><option value="false" {"selected" if cfg('SMART_DETECTION','true').lower()=='false' else ""}>Disabled</option></select><div class="form-hint">Ban if user on 2+ nodes at same time</div></div>
+<div><label>Detection Window (sec)</label><input name="CONCURRENT_WINDOW" value="{cfg_int('CONCURRENT_WINDOW',30)}" type="number" min="10" max="120"><div class="form-hint">Time window to check (30 sec recommended)</div></div>
 </div></div>
 
 <div class="card"><h2>🔐 Password</h2>
@@ -900,7 +841,7 @@ async def action_save_settings(req):
         'DROP_ALL_IPS': data.get('DROP_ALL_IPS', 'true'),
         'SMART_DETECTION': data.get('SMART_DETECTION', 'true'),
         'CONCURRENT_WINDOW': data.get('CONCURRENT_WINDOW', '60'),
-        'SUBNET_MASK': data.get('SUBNET_MASK', '8'),
+
     })
     save_env(env)
     if data.get('new_password'):
